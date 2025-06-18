@@ -110,6 +110,8 @@ class RESOLVI(
         semisupervised=False,
         mixture_k=50,
         downsample_counts=True,
+        perturbation_embed_dim: int = 16,
+        perturbation_hidden_dim: int = 64,
         **model_kwargs,
     ):
         pyro.clear_param_store()
@@ -126,6 +128,13 @@ class RESOLVI(
             else None
         )
         n_labels = self.summary_stats.n_labels - 1
+        
+        # Get number of perturbation categories
+        n_perturbs = (
+            self.adata_manager.get_state_registry("perturbation").n_cats_per_key[0] 
+            if "perturbation" in self.adata_manager.data_registry
+            else 1
+        )
 
         if background_ratio is None:
             background_ratio = results["background_ratio"]
@@ -164,6 +173,9 @@ class RESOLVI(
             semisupervised=semisupervised,
             downsample_counts_mean=downsample_counts_mean,
             downsample_counts_std=downsample_counts_std,
+            n_perturbs=n_perturbs,
+            perturbation_embed_dim=perturbation_embed_dim,
+            perturbation_hidden_dim=perturbation_hidden_dim,
             **model_kwargs,
         )
         self._model_summary_string = (
@@ -278,6 +290,7 @@ class RESOLVI(
         batch_key: str | None = None,
         labels_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
+        perturbation_key: str | None = None,
         prepare_data: bool | None = True,
         prepare_data_kwargs: dict = None,
         unlabeled_category: str = "unknown",
@@ -292,6 +305,8 @@ class RESOLVI(
         %(param_batch_key)s
         %(param_labels_key)s
         %(param_cat_cov_keys)s
+        perturbation_key
+            Key in adata.obs for perturbation categories (e.g., knockout conditions).
         prepare_data
             If True, prepares AnnData for training. Computes spatial neighbors and distances.
         prepare_data_kwargs
@@ -331,6 +346,7 @@ class RESOLVI(
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
             CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
+            CategoricalObsField("perturbation", perturbation_key),
             ObsmField("index_neighbor", "index_neighbor"),
             ObsmField("distance_neighbor", "distance_neighbor"),
             CategoricalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
