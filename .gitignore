@@ -29,3 +29,6 @@ __pycache__/
 
 # node
 /node_modules/
+
+/resolve_perurb_tests/supervised_resolvi.model/adata.h5ad
+/resolve_perurb_tests/**

@@ -469,3 +469,174 @@ class ResolVIPredictiveMixin:
             )
         else:
             return neighbor_abundance
+
+    @torch.inference_mode()
+    def get_perturbation_effects(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        perturbation_list: Sequence[int] | None = None,
+        gene_list: Sequence[str] | None = None,
+        n_samples: int = 30,
+        batch_size: int | None = None,
+        return_mean: bool = True,
+        return_numpy: bool | None = None,
+    ) -> np.ndarray | pd.DataFrame:
+        """Get perturbation effects by comparing full model outputs."""
+        adata = self._validate_anndata(adata)
+        
+        # Ensure model is in eval mode
+        self.module.eval()
+        
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        
+        # Debug: Check n_perturbs
+        n_perturbs = self.module.model.n_perturbs
+        print(f"Number of perturbations: {n_perturbs}")
+        
+        if perturbation_list is None:
+            if n_perturbs <= 1:
+                raise ValueError(f"Model has {n_perturbs} perturbations, need at least 2 (including control)")
+            perturbation_list = list(range(1, n_perturbs))
+        
+        print(f"Computing effects for perturbations: {perturbation_list}")
+        
+        gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+        
+        if n_samples > 1 and return_mean is False:
+            if return_numpy is False:
+                warnings.warn(
+                    "`return_numpy` must be `True` if `n_samples > 1` and `return_mean` "
+                    "is `False`, returning an `np.ndarray`.",
+                    UserWarning,
+                    stacklevel=settings.warnings_stacklevel,
+                )
+            return_numpy = True
+        
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        
+        _, _, device = parse_device_args(
+            "auto", "auto", return_device="torch", validate_single_device=True,
+        )
+
+        perturbation_effects = []
+
+        for tensors in scdl:
+            _, kwargs = self.module._get_fn_args_from_batch(tensors)
+            kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
+
+            if kwargs["cat_covs"] is not None and self.module.encode_covariates:
+                categorical_input = list(torch.split(kwargs["cat_covs"], 1, dim=1))
+            else:
+                categorical_input = ()
+
+            # Get latent representation
+            qz_m, qz_v, _ = self.module.z_encoder(
+                torch.log1p(kwargs["x"] / torch.mean(kwargs["x"], dim=1, keepdim=True)),
+                kwargs["batch_index"],
+                *categorical_input,
+            )
+            
+            # Debug: Check for NaN in latent representation
+            if torch.isnan(qz_m).any() or torch.isnan(qz_v).any():
+                print("NaN detected in latent representation!")
+                return None
+                
+            z = torch.distributions.Normal(qz_m, qz_v.sqrt()).sample([n_samples])
+            
+            # Get baseline decoder output (without perturbation)
+            px_scale_base, _, px_rate_base, _ = self.module.model.decoder(
+                self.module.model.dispersion, z, kwargs["library"], 
+                kwargs["batch_index"], *categorical_input
+            )
+            
+            # Debug: Check decoder outputs
+            if torch.isnan(px_rate_base).any():
+                print("NaN detected in decoder output!")
+                return None
+            
+            batch_effects = []
+            
+            # Compute control effect
+            control_tensor = torch.zeros((kwargs["x"].shape[0],), device=device, dtype=torch.long)
+            u_k_control = self.module.model.perturb_emb(control_tensor)
+            
+            # Debug: Check perturbation embedding
+            if torch.isnan(u_k_control).any():
+                print("NaN detected in control perturbation embedding!")
+                return None
+                
+            if z.ndim == 3 and u_k_control.ndim == 2:
+                u_k_control = u_k_control.unsqueeze(0).expand(z.shape[0], -1, -1)
+            
+            delta_control = self.module.model.shift_net(torch.cat([z, u_k_control], dim=-1))
+            
+            # Debug: Check shift network output
+            if torch.isnan(delta_control).any():
+                print("NaN detected in control shift network output!")
+                return None
+                
+            px_rate_control = px_rate_base + delta_control
+            
+            for perturb_idx in perturbation_list:
+                # Compute perturbation effect
+                perturb_tensor = torch.full((kwargs["x"].shape[0],), perturb_idx, 
+                                        device=device, dtype=torch.long)
+                u_k = self.module.model.perturb_emb(perturb_tensor)
+                
+                if z.ndim == 3 and u_k.ndim == 2:
+                    u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
+                
+                delta = self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
+                px_rate_perturb = px_rate_base + delta
+                
+                # Use more robust log fold change computation
+                eps = 1e-8
+                # Ensure positive values before log
+                px_rate_control_safe = torch.clamp(px_rate_control, min=eps)
+                px_rate_perturb_safe = torch.clamp(px_rate_perturb, min=eps)
+                
+                # Compute log fold change
+                log_fc = torch.log2(px_rate_perturb_safe / px_rate_control_safe)
+                
+                # Debug: Check for NaN in log fold change
+                if torch.isnan(log_fc).any():
+                    print(f"NaN detected in log fold change for perturbation {perturb_idx}!")
+                    print(f"px_rate_control range: {px_rate_control.min():.6f} - {px_rate_control.max():.6f}")
+                    print(f"px_rate_perturb range: {px_rate_perturb.min():.6f} - {px_rate_perturb.max():.6f}")
+                    return None
+                
+                log_fc = log_fc[..., gene_mask].cpu()
+                batch_effects.append(log_fc)
+            
+            batch_effects = torch.stack(batch_effects, dim=1)
+            perturbation_effects.append(batch_effects)
+
+        perturbation_effects = torch.cat(perturbation_effects, dim=2)
+        
+        # Debug: Check final tensor before averaging
+        if torch.isnan(perturbation_effects).any():
+            print("NaN detected in final perturbation effects!")
+            print(f"Tensor shape: {perturbation_effects.shape}")
+            print(f"NaN count: {torch.isnan(perturbation_effects).sum()}")
+            return None
+        
+        # Average across cells
+        perturbation_effects = perturbation_effects.mean(dim=2).numpy()
+        
+        if return_mean:
+            perturbation_effects = perturbation_effects.mean(axis=0)
+
+        if return_numpy is None or return_numpy is False:
+            gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
+            perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
+            
+            if return_mean:
+                return pd.DataFrame(
+                    perturbation_effects, columns=gene_names, index=perturbation_names,
+                )
+            else:
+                return perturbation_effects
+        else:
+            return perturbation_effects

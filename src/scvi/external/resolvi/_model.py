@@ -130,11 +130,12 @@ class RESOLVI(
         n_labels = self.summary_stats.n_labels - 1
         
         # Get number of perturbation categories
-        n_perturbs = (
-            self.adata_manager.get_state_registry("perturbation").n_cats_per_key[0] 
-            if "perturbation" in self.adata_manager.data_registry
-            else 1
-        )
+        if "perturbation" in self.adata_manager.data_registry:
+            perturb_state_registry = self.adata_manager.get_state_registry("perturbation")
+            # Get number of categories from the categorical mapping
+            n_perturbs = len(perturb_state_registry.categorical_mapping)
+        else:
+            n_perturbs = 1
 
         if background_ratio is None:
             background_ratio = results["background_ratio"]
@@ -291,6 +292,7 @@ class RESOLVI(
         labels_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         perturbation_key: str | None = None,
+        control_perturbation: str | None = None,
         prepare_data: bool | None = True,
         prepare_data_kwargs: dict = None,
         unlabeled_category: str = "unknown",
@@ -307,6 +309,9 @@ class RESOLVI(
         %(param_cat_cov_keys)s
         perturbation_key
             Key in adata.obs for perturbation categories (e.g., knockout conditions).
+        control_perturbation
+            Value in perturbation_key column that represents the control condition.
+            If None, the first category alphabetically will be used as control.
         prepare_data
             If True, prepares AnnData for training. Computes spatial neighbors and distances.
         prepare_data_kwargs
@@ -342,6 +347,19 @@ class RESOLVI(
             if prepare_data_kwargs is None:
                 prepare_data_kwargs = {}
             RESOLVI._prepare_data(adata, batch_key=batch_key, **prepare_data_kwargs)
+
+        # Handle control perturbation mapping
+        if perturbation_key is not None and control_perturbation is not None:
+            # Ensure control perturbation is at index 0
+            if control_perturbation not in adata.obs[perturbation_key].unique():
+                raise ValueError(f"Control perturbation '{control_perturbation}' not found in {perturbation_key}")
+            
+            # Reorder categories to put control first
+            current_categories = adata.obs[perturbation_key].cat.categories.tolist()
+            if control_perturbation in current_categories:
+                current_categories.remove(control_perturbation)
+                new_categories = [control_perturbation] + current_categories
+                adata.obs[perturbation_key] = adata.obs[perturbation_key].cat.reorder_categories(new_categories)
 
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),

@@ -455,7 +455,14 @@ class RESOLVAEModel(PyroModule):
             if perturb_idx is not None:
                 # perturb_idx: LongTensor[n_cells] in {0,…,n_perturbs-1}, with 0 = "no KO"
                 u_k = self.perturb_emb(perturb_idx)                    # → (n_cells, D_s)
-                delta = self.shift_net(torch.cat([z, u_k], dim=-1))   # → (n_cells, n_genes)
+                
+                # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
+                if z.ndim == 3 and u_k.ndim == 2:
+                    # z: [n_particles, n_cells, n_latent], u_k: [n_cells, embedding_dim]
+                    # Expand u_k to match z's dimensions
+                    u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)  # → [n_particles, n_cells, embedding_dim]
+                
+                delta = self.shift_net(torch.cat([z, u_k], dim=-1))   # → (n_cells, n_genes) or (n_particles, n_cells, n_genes)
                 # Only add shift for non-zero perturbation indices (assuming 0 = control)
                 px_rate = px_rate + delta
 
@@ -537,8 +544,10 @@ class RESOLVAEModel(PyroModule):
             if self.gene_likelihood == "poisson":
                 mean_nb = Delta(px_rate_sum, event_dim=1).rsample()
             else:
+                # Fix the rate parameter to avoid constraint violations
+                rate_param = torch.clamp(px_r / (px_rate_sum + self.eps), min=self.eps, max=1e6)
                 mean_nb = (
-                    Gamma(concentration=px_r, rate=px_r / (px_rate_sum + self.eps))
+                    Gamma(concentration=px_r, rate=rate_param)
                     .to_event(1)
                     .rsample()
                 )
