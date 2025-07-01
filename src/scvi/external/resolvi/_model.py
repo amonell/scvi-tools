@@ -129,13 +129,98 @@ class RESOLVI(
         )
         n_labels = self.summary_stats.n_labels - 1
         
-        # Get number of perturbation categories
-        if "perturbation" in self.adata_manager.data_registry:
-            perturb_state_registry = self.adata_manager.get_state_registry("perturbation")
-            # Get number of categories from the categorical mapping
-            n_perturbs = len(perturb_state_registry.categorical_mapping)
-        else:
-            n_perturbs = 1
+        # Get number of perturbation categories by inspecting registered fields
+        n_perturbs = 1  # default (no perturbations)
+        perturbation_idx = None
+        
+        # Check if we have categorical covariates and extract perturbation info
+        try:
+            print("Debug: Starting perturbation detection...")
+            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+                cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+                print(f"Debug: Found categorical covariates registry: {cat_state_registry}")
+                
+                # Get the field keys (which are the categorical covariate names)
+                if hasattr(cat_state_registry, 'field_keys'):
+                    field_keys = cat_state_registry.field_keys
+                    print(f"Debug: Field keys found: {field_keys}")
+                    
+                    # Look for perturbation key in setup args - try multiple approaches
+                    perturbation_key = None
+                    
+                    # Method 1: Try registry.setup_method_args
+                    if hasattr(self.adata_manager, 'registry') and hasattr(self.adata_manager.registry, 'setup_method_args'):
+                        setup_method_args = self.adata_manager.registry.setup_method_args
+                        perturbation_key = setup_method_args.get('perturbation_key')
+                        print(f"Debug: Method 1 - setup_method_args: {setup_method_args}")
+                        print(f"Debug: Method 1 - perturbation_key: {perturbation_key}")
+                    
+                    # Method 2: Try direct access to setup_method_args
+                    if not perturbation_key and hasattr(self.adata_manager, 'setup_method_args'):
+                        setup_method_args = self.adata_manager.setup_method_args
+                        perturbation_key = setup_method_args.get('perturbation_key')
+                        print(f"Debug: Method 2 - setup_method_args: {setup_method_args}")
+                        print(f"Debug: Method 2 - perturbation_key: {perturbation_key}")
+                    
+                    # Method 3: Check the _registry itself
+                    if not perturbation_key and hasattr(self.adata_manager, '_registry'):
+                        registry = self.adata_manager._registry
+                        if hasattr(registry, 'setup_method_args'):
+                            setup_method_args = registry.setup_method_args
+                            perturbation_key = setup_method_args.get('perturbation_key')
+                            print(f"Debug: Method 3 - setup_method_args: {setup_method_args}")
+                            print(f"Debug: Method 3 - perturbation_key: {perturbation_key}")
+                    
+                    # Method 4: Check AnnDataManager's own setup_method_args
+                    if not perturbation_key:
+                        for attr_name in ['setup_method_args', '_setup_method_args']:
+                            if hasattr(self.adata_manager, attr_name):
+                                setup_method_args = getattr(self.adata_manager, attr_name)
+                                if isinstance(setup_method_args, dict):
+                                    perturbation_key = setup_method_args.get('perturbation_key')
+                                    print(f"Debug: Method 4 ({attr_name}) - setup_method_args: {setup_method_args}")
+                                    print(f"Debug: Method 4 ({attr_name}) - perturbation_key: {perturbation_key}")
+                                    if perturbation_key:
+                                        break
+                    
+                    # Method 5: Check if field_keys contains what looks like perturbation data
+                    if not perturbation_key:
+                        print("Debug: Trying to auto-detect perturbation from field keys...")
+                        for key in field_keys:
+                            print(f"Debug: Checking field key: {key}")
+                            # This might be the perturbation key we're looking for
+                            if key in ['mapped_batch', 'perturbation', 'condition', 'treatment', 'guide_rnas', 'guide_rna', 'grna', 'crispr']:
+                                perturbation_key = key
+                                print(f"Debug: Auto-detected perturbation key: {perturbation_key}")
+                                break
+                    
+                    print(f"Debug: Final perturbation_key: {perturbation_key}")
+                    print(f"Debug: field_keys: {field_keys}")
+                    
+                    if perturbation_key and perturbation_key in field_keys:
+                        # Found the perturbation! Get its index and number of categories
+                        perturbation_idx = field_keys.index(perturbation_key)
+                        if hasattr(cat_state_registry, 'n_cats_per_key'):
+                            n_perturbs = cat_state_registry.n_cats_per_key[perturbation_idx]
+                            print(f"Successfully detected perturbation '{perturbation_key}' at index {perturbation_idx} with {n_perturbs} categories")
+                        else:
+                            print(f"Debug: cat_state_registry doesn't have n_cats_per_key attribute")
+                    else:
+                        if perturbation_key:
+                            print(f"Debug: Perturbation key '{perturbation_key}' not found in field_keys {field_keys}")
+                        else:
+                            print("Debug: No perturbation key found")
+                else:
+                    print("Debug: cat_state_registry doesn't have field_keys attribute")
+            else:
+                print(f"Debug: No categorical covariates found in data_registry. Available keys: {list(self.adata_manager.data_registry.keys())}")
+                        
+        except Exception as e:
+            print(f"Warning: Could not detect perturbation info: {e}")
+            import traceback
+            traceback.print_exc()
+            # Just use defaults
+            pass
 
         if background_ratio is None:
             background_ratio = results["background_ratio"]
@@ -177,6 +262,7 @@ class RESOLVI(
             n_perturbs=n_perturbs,
             perturbation_embed_dim=perturbation_embed_dim,
             perturbation_hidden_dim=perturbation_hidden_dim,
+            perturbation_idx=perturbation_idx,
             **model_kwargs,
         )
         self._model_summary_string = (
@@ -348,23 +434,29 @@ class RESOLVI(
                 prepare_data_kwargs = {}
             RESOLVI._prepare_data(adata, batch_key=batch_key, **prepare_data_kwargs)
 
-        # Handle control perturbation mapping
-        if perturbation_key is not None and control_perturbation is not None:
-            # Ensure control perturbation is at index 0
-            if control_perturbation not in adata.obs[perturbation_key].unique():
-                raise ValueError(f"Control perturbation '{control_perturbation}' not found in {perturbation_key}")
+        # Handle control perturbation mapping and include in categorical covariates
+        if perturbation_key is not None:
+            if control_perturbation is not None:
+                # Ensure control perturbation is at index 0
+                if control_perturbation not in adata.obs[perturbation_key].unique():
+                    raise ValueError(f"Control perturbation '{control_perturbation}' not found in {perturbation_key}")
+                
+                # Reorder categories to put control first
+                current_categories = adata.obs[perturbation_key].cat.categories.tolist()
+                if control_perturbation in current_categories:
+                    current_categories.remove(control_perturbation)
+                    new_categories = [control_perturbation] + current_categories
+                    adata.obs[perturbation_key] = adata.obs[perturbation_key].cat.reorder_categories(new_categories)
             
-            # Reorder categories to put control first
-            current_categories = adata.obs[perturbation_key].cat.categories.tolist()
-            if control_perturbation in current_categories:
-                current_categories.remove(control_perturbation)
-                new_categories = [control_perturbation] + current_categories
-                adata.obs[perturbation_key] = adata.obs[perturbation_key].cat.reorder_categories(new_categories)
+            # Include perturbation in categorical covariates
+            if categorical_covariate_keys is None:
+                categorical_covariate_keys = [perturbation_key]
+            else:
+                categorical_covariate_keys = list(categorical_covariate_keys) + [perturbation_key]
 
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
             CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
-            CategoricalObsField("perturbation", perturbation_key),
             ObsmField("index_neighbor", "index_neighbor"),
             ObsmField("distance_neighbor", "distance_neighbor"),
             CategoricalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),

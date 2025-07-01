@@ -141,6 +141,7 @@ class RESOLVAEModel(PyroModule):
         n_perturbs: int = 1,
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
+        perturbation_idx: int | None = None,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -160,6 +161,7 @@ class RESOLVAEModel(PyroModule):
         self.eps = torch.tensor(1e-6)
         self.encode_covariates = encode_covariates
         self.n_perturbs = n_perturbs
+        self.perturbation_idx = perturbation_idx  # Index of perturbation in cat_covs
         
         # Perturbation embedding and shift network
         self.perturb_emb = torch.nn.Embedding(n_perturbs, perturbation_embed_dim)
@@ -256,11 +258,6 @@ class RESOLVAEModel(PyroModule):
         ind_x = tensor_dict[REGISTRY_KEYS.INDICES_KEY].long().ravel()
         distances_n = tensor_dict["distance_neighbor"]
         ind_neighbors = tensor_dict["index_neighbor"].long()
-        
-        # Extract perturbation index
-        perturb_idx = tensor_dict.get("perturbation")
-        if perturb_idx is not None:
-            perturb_idx = perturb_idx.long().ravel()
 
         x_n = self.expression_anntorchdata[ind_neighbors.cpu().numpy().flatten(), :]["X"]
         if isinstance(x_n, np.ndarray):
@@ -283,7 +280,6 @@ class RESOLVAEModel(PyroModule):
             "cat_covs": cat_covs,
             "x_n": x_n,
             "distances_n": distances_n,
-            "perturb_idx": perturb_idx,
         }
 
     @auto_move_data
@@ -297,7 +293,6 @@ class RESOLVAEModel(PyroModule):
         cat_covs: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
-        perturb_idx: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -452,8 +447,11 @@ class RESOLVAEModel(PyroModule):
             )
             
             # --- Add perturbation shift onto the true channel ---
-            if perturb_idx is not None:
-                # perturb_idx: LongTensor[n_cells] in {0,…,n_perturbs-1}, with 0 = "no KO"
+            if self.perturbation_idx is not None and cat_covs is not None:
+                print("--- Debugging Perturbation Shift ---")
+                # Extract perturbation index from categorical covariates
+                px_rate_pre_shift = px_rate.clone()
+                perturb_idx = cat_covs[:, self.perturbation_idx].long()
                 u_k = self.perturb_emb(perturb_idx)                    # → (n_cells, D_s)
                 
                 # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
@@ -463,8 +461,29 @@ class RESOLVAEModel(PyroModule):
                     u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)  # → [n_particles, n_cells, embedding_dim]
                 
                 delta = self.shift_net(torch.cat([z, u_k], dim=-1))   # → (n_cells, n_genes) or (n_particles, n_cells, n_genes)
+                
+                print(f"Decoder px_rate (before shift) stats: mean={px_rate_pre_shift.mean().item():.4f}, std={px_rate_pre_shift.std().item():.4f}, min={px_rate_pre_shift.min().item():.4f}, max={px_rate_pre_shift.max().item():.4f}")
+                print(f"Shift net delta stats: mean={delta.mean().item():.4f}, std={delta.std().item():.4f}, min={delta.min().item():.4f}, max={delta.max().item():.4f}")
+
                 # Only add shift for non-zero perturbation indices (assuming 0 = control)
-                px_rate = px_rate + delta
+                mask  = (perturb_idx != 0).float().unsqueeze(-1)   # 1 → perturbed, 0 → control
+                if z.ndim == 3:                                    # particles dimension
+                    mask = mask.unsqueeze(0)
+                
+                if torch.any(mask > 0):
+                    print(f"Applying shift for {int(torch.sum(mask > 0))} perturbed cells out of {len(mask.flatten())} cells.")
+                else:
+                    print("No perturbed cells in this batch, no shift applied.")
+
+                # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
+                # This ensures λ > 0 even with negative δ
+                log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
+                log_px_rate = log_px_rate_base + mask * delta
+                px_rate = torch.exp(log_px_rate)
+                
+                print(f"Log px_rate (base) stats: mean={log_px_rate_base.mean().item():.4f}, std={log_px_rate_base.std().item():.4f}, min={log_px_rate_base.min().item():.4f}, max={log_px_rate_base.max().item():.4f}")
+                print(f"Log px_rate (after shift) stats: mean={log_px_rate.mean().item():.4f}, std={log_px_rate.std().item():.4f}, min={log_px_rate.min().item():.4f}, max={log_px_rate.max().item():.4f}")
+                print(f"Decoder px_rate (after exp) stats: mean={px_rate.mean().item():.4f}, std={px_rate.std().item():.4f}, min={px_rate.min().item():.4f}, max={px_rate.max().item():.4f}")
 
             if self.semisupervised:
                 probs_prediction_ = self.classifier(z)
@@ -552,6 +571,10 @@ class RESOLVAEModel(PyroModule):
                     .rsample()
                 )
 
+            if self.perturbation_idx is not None and cat_covs is not None:
+                print(f"mean_nb stats: mean={mean_nb.mean().item():.4f}, std={mean_nb.std().item():.4f}, min={mean_nb.min().item():.4f}, max={mean_nb.max().item():.4f}")
+                print(f"background stats: mean={background.mean().item():.4f}, std={background.std().item():.4f}, min={background.min().item():.4f}, max={background.max().item():.4f}")
+
             mean_poisson = pyro.deterministic(
                 "mean_poisson",
                 mean_nb + background,
@@ -560,6 +583,10 @@ class RESOLVAEModel(PyroModule):
 
             # Sample count distribution
             pyro.sample("obs", Poisson(mean_poisson + 1e-9).to_event(1))
+
+            if self.perturbation_idx is not None and cat_covs is not None:
+                print(f"Final mean_poisson stats: mean={mean_poisson.mean().item():.4f}, std={mean_poisson.std().item():.4f}, min={mean_poisson.min().item():.4f}, max={mean_poisson.max().item():.4f}")
+                print("--------------------------------------")
 
             if self.semisupervised:
                 probs_prediction = pyro.deterministic(
@@ -590,14 +617,13 @@ class RESOLVAEModel(PyroModule):
         cat_covs: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
-        perturb_idx: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
         """Forward pass."""
         # Using condition handle for training, this is the reconstruction loss.
         pyro.condition(self.model_unconditioned, data={"obs": x})(
-            x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, perturb_idx, n_obs, kl_weight
+            x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, n_obs, kl_weight
         )
 
     @auto_move_data
@@ -611,7 +637,6 @@ class RESOLVAEModel(PyroModule):
         cat_covs: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
-        perturb_idx: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -622,7 +647,7 @@ class RESOLVAEModel(PyroModule):
                 "diffusion_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
                 "true_mixture_proportion": torch.ones(x.shape[0], device=x.device),
             },
-        )(x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, perturb_idx, n_obs, kl_weight)
+        )(x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, n_obs, kl_weight)
 
     @auto_move_data
     def model_residuals(
@@ -635,7 +660,6 @@ class RESOLVAEModel(PyroModule):
         cat_covs: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
-        perturb_idx: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -644,7 +668,7 @@ class RESOLVAEModel(PyroModule):
             data={
                 "true_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
             },
-        )(x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, perturb_idx, n_obs, kl_weight)
+        )(x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, n_obs, kl_weight)
 
     @auto_move_data
     def model_simplified(
@@ -657,7 +681,6 @@ class RESOLVAEModel(PyroModule):
         cat_covs: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
-        perturb_idx: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
         corrected_rate: bool = False,
@@ -690,10 +713,10 @@ class RESOLVAEModel(PyroModule):
                         "diffusion_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
                         "true_mixture_proportion": torch.ones(x.shape[0], device=x.device),
                     },
-                )(x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, perturb_idx, n_obs, kl_weight)
+                )(x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, n_obs, kl_weight)
             else:
                 simplified_model(
-                    x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, perturb_idx, n_obs, kl_weight
+                    x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, n_obs, kl_weight
                 )
 
 
@@ -831,7 +854,6 @@ class RESOLVAEGuide(PyroModule):
         cat_covs,
         x_n,
         distances_n,
-        perturb_idx=None,
         n_obs=None,
         kl_weight=1.0,
     ):
@@ -958,7 +980,6 @@ class RESOLVAEGuide(PyroModule):
         cat_covs: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
-        perturb_idx: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -980,7 +1001,7 @@ class RESOLVAEGuide(PyroModule):
 
         with pyro.poutine.scale(scale=x.shape[0] / self.n_obs):
             simplified_guide(
-                x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, perturb_idx, n_obs, kl_weight
+                x, ind_x, library, y, batch_index, cat_covs, x_n, distances_n, n_obs, kl_weight
             )
 
 
@@ -1111,6 +1132,7 @@ class RESOLVAE(PyroBaseModuleClass):
         n_perturbs: int = 1,
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
+        perturbation_idx: int | None = None,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1198,6 +1220,7 @@ class RESOLVAE(PyroBaseModuleClass):
             n_perturbs=n_perturbs,
             perturbation_embed_dim=perturbation_embed_dim,
             perturbation_hidden_dim=perturbation_hidden_dim,
+            perturbation_idx=perturbation_idx,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 
