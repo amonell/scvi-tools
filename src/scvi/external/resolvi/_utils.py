@@ -16,6 +16,33 @@ from scvi.utils import track
 logger = logging.getLogger(__name__)
 
 
+def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Safely compute log1p(x / mean(x)) with numerical stability checks.
+    
+    Parameters
+    ----------
+    x
+        Input tensor
+    dim
+        Dimension along which to compute mean
+    keepdim
+        Whether to keep the dimension
+    eps
+        Small epsilon to prevent division by zero
+        
+    Returns
+    -------
+    Normalized and log-transformed tensor with invalid values replaced by zeros.
+    """
+    x_mean = torch.mean(x, dim=dim, keepdim=keepdim)
+    x_mean_safe = torch.clamp(x_mean, min=eps)
+    x_normalized = x / x_mean_safe
+    x_log = torch.log1p(x_normalized)
+    # Handle any remaining invalid values (NaN, inf)
+    return torch.where(torch.isfinite(x_log), x_log, torch.zeros_like(x_log))
+
+
 class ResolVIPredictiveMixin:
     """Mixin class for generating samples from posterior distribution using infer.predictive."""
 
@@ -81,7 +108,8 @@ class ResolVIPredictiveMixin:
                 categorical_input = ()
 
             # Force explicit device transfer right before encoder call
-            x_input = torch.log1p(kwargs["x"] / torch.mean(kwargs["x"], dim=1, keepdim=True))
+            # Add numerical stability
+            x_input = _safe_log_norm(kwargs["x"])
             batch_input = kwargs["batch_index"]
             
             # Ensure all inputs are on the correct device
@@ -316,8 +344,11 @@ class ResolVIPredictiveMixin:
                 else:
                     categorical_input = ()
 
+                # Add numerical stability
+                x_log = _safe_log_norm(kwargs["x"])
+                
                 qz_m, qz_v, _ = self.module.z_encoder(
-                    torch.log1p(kwargs["x"] / torch.mean(kwargs["x"], dim=1, keepdim=True)),
+                    x_log,
                     kwargs["batch_index"],
                     *categorical_input,
                 )
@@ -501,7 +532,13 @@ class ResolVIPredictiveMixin:
         batch_size: int | None = None,
         return_mean: bool = True,
         return_numpy: bool | None = None,
-    ) -> np.ndarray | pd.DataFrame:
+        return_uncertainty: bool = False,
+        uncertainty_metrics: Sequence[str] = ("std", "ci_95"),
+        alpha: float = 0.05,
+        cell_summary_fn: str = "median",
+        preserve_cell_heterogeneity: bool = True,
+        show_progress: bool = True,
+    ) -> np.ndarray | pd.DataFrame | dict:
         """
         Get perturbation effects using the full generative model counterfactual pipeline.
         
@@ -509,6 +546,58 @@ class ResolVIPredictiveMixin:
         1. Uses fixed latent representations from get_latent_representation
         2. Generates counterfactual expressions for each perturbation via the full model
         3. Compares the resulting count distributions (not just rates)
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        perturbation_list
+            List of perturbation indices to compare. If `None`, uses all non-control perturbations.
+        gene_list
+            Return effects for a subset of genes. If `None`, all genes are used.
+        n_samples
+            Number of posterior samples to use for estimation.
+        batch_size
+            Minibatch size for data loading into model.
+        return_mean
+            Whether to return the mean of the samples.
+        return_numpy
+            Return a numpy array instead of a pandas DataFrame.
+        return_uncertainty
+            Whether to return uncertainty metrics alongside the effects.
+        uncertainty_metrics
+            Which uncertainty metrics to compute. Options:
+            - "std": Standard deviation across samples
+            - "var": Variance across samples  
+            - "ci_95": 95% credible interval (2.5% and 97.5% percentiles)
+            - "ci_90": 90% credible interval (5% and 95% percentiles)
+            - "prob_positive": Probability that effect is positive
+            - "prob_negative": Probability that effect is negative
+            - "prob_significant": Probability that |effect| > threshold
+        alpha
+            Significance threshold for prob_significant (default 0.05 corresponds to ~1.4 log2FC).
+        cell_summary_fn
+            Function to summarize per-cell effects within each posterior sample.
+            Options: "median", "mean", "trimmed_mean". 
+        preserve_cell_heterogeneity
+            If True, computes cell-level uncertainty before pooling. For each posterior sample,
+            first computes per-cell log2FC, then summarizes across cells, then computes
+            uncertainty across samples. This preserves heterogeneity - genes expressed in
+            few cells will have wider uncertainty intervals.
+            If False, uses the original approach (average across cells first).
+        show_progress
+            If True, displays progress bars for batch processing and uncertainty computation.
+            
+        Returns
+        -------
+        If return_uncertainty is False:
+            Effects as numpy array or DataFrame
+        If return_uncertainty is True:
+            Dictionary with keys:
+            - "effects": Main effects (mean or all samples)
+            - "uncertainty": Dictionary of uncertainty metrics
         """
         import pyro
         from pyro import distributions as dist
@@ -564,7 +653,7 @@ class ResolVIPredictiveMixin:
             
         gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
         
-        if n_samples > 1 and return_mean is False:
+        if n_samples > 1 and return_mean is False and not return_uncertainty:
             if return_numpy is False:
                 warnings.warn(
                     "`return_numpy` must be `True` if `n_samples > 1` and `return_mean` "
@@ -603,7 +692,22 @@ class ResolVIPredictiveMixin:
         all_counterfactual_counts = []
         baseline_perturbation = None  # Will be set from first batch
         
-        for tensors in scdl:
+        # Calculate total operations for progress tracking
+        n_batches = len(scdl)
+        # Note: actual perturbations per batch may vary, but this gives a rough estimate
+        estimated_perturbations_per_batch = len(perturbation_list) + 1  # +1 for baseline
+        
+        # Conditionally add progress tracking
+        if show_progress:
+            progress_iter = track(
+                enumerate(scdl),
+                total=n_batches,
+                description=f"Processing {n_batches} batches (≈{estimated_perturbations_per_batch} perturbations × {n_samples} samples each)"
+            )
+        else:
+            progress_iter = enumerate(scdl)
+        
+        for batch_idx, tensors in progress_iter:
             _, kwargs = self.module._get_fn_args_from_batch(tensors)
             kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
             
@@ -628,7 +732,18 @@ class ResolVIPredictiveMixin:
             
             all_perturb_vals = [baseline_perturb] + [p for p in perturbation_list if p != baseline_perturb]
             
-            for perturb_val in all_perturb_vals:
+            # Track progress within each batch for perturbation computation
+            if show_progress:
+                perturb_progress = track(
+                    enumerate(all_perturb_vals),
+                    total=len(all_perturb_vals),
+                    description=f"Batch {batch_idx+1}/{n_batches}: Running {len(all_perturb_vals)} perturbations ({n_samples} samples each)",
+                    leave=False
+                )
+            else:
+                perturb_progress = enumerate(all_perturb_vals)
+            
+            for perturb_idx_local, perturb_val in perturb_progress:
                 # Create modified cat_covs with this specific perturbation
                 if kwargs["cat_covs"] is not None:
                     cat_covs_modified = kwargs["cat_covs"].clone()
@@ -687,21 +802,448 @@ class ResolVIPredictiveMixin:
         # Stack and process results
         perturbation_effects = torch.stack(perturbation_effects, dim=1)  # [n_samples, n_perturbs, n_cells, n_genes]
         
-        # Average across cells
-        perturbation_effects = perturbation_effects.mean(dim=2).cpu().numpy()  # [n_samples, n_perturbs, n_genes]
+        # Choose how to summarize across cells
+        if preserve_cell_heterogeneity:
+            # For each posterior sample, compute robust summary across cells
+            # This preserves information about cell-to-cell heterogeneity
+            if cell_summary_fn == "median":
+                perturbation_effects = torch.median(perturbation_effects, dim=2)[0]  # [n_samples, n_perturbs, n_genes]
+            elif cell_summary_fn == "mean":
+                perturbation_effects = perturbation_effects.mean(dim=2)  # [n_samples, n_perturbs, n_genes]
+            elif cell_summary_fn == "trimmed_mean":
+                # Remove top and bottom 10% of cells, then take mean
+                sorted_effects, _ = torch.sort(perturbation_effects, dim=2)
+                n_cells = perturbation_effects.shape[2]
+                trim_size = max(1, int(0.1 * n_cells))
+                trimmed_effects = sorted_effects[:, :, trim_size:n_cells-trim_size, :]
+                perturbation_effects = trimmed_effects.mean(dim=2)  # [n_samples, n_perturbs, n_genes]
+            else:
+                raise ValueError(f"Unknown cell_summary_fn: {cell_summary_fn}")
+        else:
+            # Original approach: simple average across cells
+            perturbation_effects = perturbation_effects.mean(dim=2)  # [n_samples, n_perturbs, n_genes]
+        
+        # Compute uncertainty metrics if requested
+        uncertainty_results = {}
+        if return_uncertainty:
+            effects_np = perturbation_effects.cpu().numpy()  # [n_samples, n_perturbs, n_genes]
+            
+            # Add progress tracking for uncertainty computation
+            if show_progress:
+                uncertainty_progress = track(
+                    uncertainty_metrics,
+                    description=f"Computing uncertainty metrics ({len(uncertainty_metrics)} metrics for {effects_np.shape[1]} perturbations × {effects_np.shape[2]} genes)"
+                )
+            else:
+                uncertainty_progress = uncertainty_metrics
+            
+            for metric in uncertainty_progress:
+                if metric == "std":
+                    uncertainty_results["std"] = np.std(effects_np, axis=0)  # [n_perturbs, n_genes]
+                elif metric == "var":
+                    uncertainty_results["var"] = np.var(effects_np, axis=0)  # [n_perturbs, n_genes]
+                elif metric == "ci_95":
+                    uncertainty_results["ci_95_lower"] = np.percentile(effects_np, 2.5, axis=0)
+                    uncertainty_results["ci_95_upper"] = np.percentile(effects_np, 97.5, axis=0)
+                elif metric == "ci_90":
+                    uncertainty_results["ci_90_lower"] = np.percentile(effects_np, 5, axis=0)
+                    uncertainty_results["ci_90_upper"] = np.percentile(effects_np, 95, axis=0)
+                elif metric == "prob_positive":
+                    uncertainty_results["prob_positive"] = np.mean(effects_np > 0, axis=0)
+                elif metric == "prob_negative":
+                    uncertainty_results["prob_negative"] = np.mean(effects_np < 0, axis=0)
+                elif metric == "prob_significant":
+                    # Probability that |effect| > alpha (default 0.05 log2FC ≈ 1.4x fold change)
+                    uncertainty_results["prob_significant"] = np.mean(np.abs(effects_np) > alpha, axis=0)
+                else:
+                    warnings.warn(f"Unknown uncertainty metric: {metric}", UserWarning)
+        
+        # Convert to numpy for final processing
+        perturbation_effects = perturbation_effects.cpu().numpy()
         
         if return_mean:
             perturbation_effects = perturbation_effects.mean(axis=0)  # [n_perturbs, n_genes]
 
+        # Format results
         if return_numpy is None or return_numpy is False:
             gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
             perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
             
             if return_mean:
-                return pd.DataFrame(
+                effects_df = pd.DataFrame(
                     perturbation_effects, index=perturbation_names, columns=gene_names
                 )
             else:
-                return perturbation_effects
+                effects_df = perturbation_effects
+                
+            if return_uncertainty:
+                # Convert uncertainty metrics to DataFrames too
+                uncertainty_dfs = {}
+                for metric_name, metric_values in uncertainty_results.items():
+                    if return_mean or metric_values.ndim == 2:  # [n_perturbs, n_genes]
+                        uncertainty_dfs[metric_name] = pd.DataFrame(
+                            metric_values, index=perturbation_names, columns=gene_names
+                        )
+                    else:
+                        uncertainty_dfs[metric_name] = metric_values
+                
+                return {
+                    "effects": effects_df,
+                    "uncertainty": uncertainty_dfs
+                }
+            else:
+                return effects_df
         else:
-            return perturbation_effects
+            if return_uncertainty:
+                return {
+                    "effects": perturbation_effects,
+                    "uncertainty": uncertainty_results
+                }
+            else:
+                return perturbation_effects
+
+    @torch.inference_mode()
+    def get_perturbation_pvalues(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        perturbation_list: Sequence[int] | None = None,
+        gene_list: Sequence[str] | None = None,
+        n_samples: int = 100,
+        batch_size: int | None = None,
+        test_type: str = "two_sided",
+        return_numpy: bool | None = None,
+        cell_summary_fn: str = "median",
+        preserve_cell_heterogeneity: bool = True,
+        show_progress: bool = True,
+    ) -> pd.DataFrame | np.ndarray:
+        """
+        Compute empirical p-values for perturbation effects.
+        
+        This method computes p-values by treating posterior samples as replicates
+        and testing whether the log fold change is significantly different from zero.
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        perturbation_list
+            List of perturbation indices to compare. If `None`, uses all non-control perturbations.
+        gene_list
+            Return p-values for a subset of genes. If `None`, all genes are used.
+        n_samples
+            Number of posterior samples to use for p-value estimation. More samples = more precise p-values.
+        batch_size
+            Minibatch size for data loading into model.
+        test_type
+            Type of test to perform:
+            - "two_sided": Test if effect != 0
+            - "greater": Test if effect > 0 (upregulation)
+            - "less": Test if effect < 0 (downregulation)
+        return_numpy
+            Return a numpy array instead of a pandas DataFrame.
+        cell_summary_fn
+            Function to summarize per-cell effects within each posterior sample.
+            Options: "median", "mean", "trimmed_mean".
+        preserve_cell_heterogeneity
+            If True, computes cell-level uncertainty before pooling for more robust p-values.
+        show_progress
+            If True, displays progress bars for effect computation and p-value calculation.
+            
+        Returns
+        -------
+        P-values for each perturbation-gene combination.
+        """
+        from scipy import stats
+        
+        # Get all posterior samples (not just mean)
+        results = self.get_perturbation_effects(
+            adata=adata,
+            indices=indices,
+            perturbation_list=perturbation_list,
+            gene_list=gene_list,
+            n_samples=n_samples,
+            batch_size=batch_size,
+            return_mean=False,
+            return_numpy=True,
+            return_uncertainty=False,
+            cell_summary_fn=cell_summary_fn,
+            preserve_cell_heterogeneity=preserve_cell_heterogeneity,
+            show_progress=show_progress,
+        )
+        
+        # results shape: [n_samples, n_perturbs, n_genes]
+        n_samples_actual, n_perturbs, n_genes = results.shape
+        
+        # Compute p-values for each perturbation-gene combination
+        pvalues = np.zeros((n_perturbs, n_genes))
+        
+        # Create progress tracking for p-value computation
+        total_tests = list(range(n_perturbs * n_genes))
+        if show_progress:
+            progress_iter = track(
+                total_tests, 
+                description=f"Computing p-values ({n_perturbs} perturbations × {n_genes} genes)"
+            )
+        else:
+            progress_iter = total_tests
+        
+        for test_idx in progress_iter:
+            perturb_idx = test_idx // n_genes
+            gene_idx = test_idx % n_genes
+            
+            samples = results[:, perturb_idx, gene_idx]
+            
+            # One-sample t-test against null hypothesis that mean = 0
+            if test_type == "two_sided":
+                _, pval = stats.ttest_1samp(samples, 0, alternative='two-sided')
+            elif test_type == "greater":
+                _, pval = stats.ttest_1samp(samples, 0, alternative='greater')
+            elif test_type == "less":
+                _, pval = stats.ttest_1samp(samples, 0, alternative='less')
+            else:
+                raise ValueError(f"Unknown test_type: {test_type}")
+            
+            pvalues[perturb_idx, gene_idx] = pval
+        
+        # Format results
+        if return_numpy is None or return_numpy is False:
+            adata = self._validate_anndata(adata)
+            gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+            gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
+            
+            # Get perturbation names
+            if perturbation_list is None:
+                n_perturbs_total = self.module.model.n_perturbs
+                perturbation_list = list(range(1, n_perturbs_total))
+            
+            perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
+            
+            return pd.DataFrame(
+                pvalues, index=perturbation_names, columns=gene_names
+            )
+        else:
+            return pvalues
+
+    @torch.inference_mode()
+    def analyze_perturbation_heterogeneity(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        perturbation_list: Sequence[int] | None = None,
+        gene_list: Sequence[str] | None = None,
+        n_samples: int = 10,
+        batch_size: int | None = None,
+        return_numpy: bool | None = None,
+    ) -> pd.DataFrame | dict:
+        """
+        Analyze cell-level heterogeneity in perturbation responses.
+        
+        This method helps understand why certain genes have wider uncertainty intervals
+        by examining the distribution of per-cell effects across posterior samples.
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        perturbation_list
+            List of perturbation indices to compare. If `None`, uses all non-control perturbations.
+        gene_list
+            Return analysis for a subset of genes. If `None`, all genes are used.
+        n_samples
+            Number of posterior samples to use for analysis.
+        batch_size
+            Minibatch size for data loading into model.
+        return_numpy
+            Return numpy arrays instead of pandas DataFrames.
+            
+        Returns
+        -------
+        Dictionary containing heterogeneity metrics:
+        - "cell_response_variability": CV of per-cell effects within each sample
+        - "fraction_responding_cells": Fraction of cells with |effect| > 0.1
+        - "median_vs_mean_difference": Difference between median and mean per-cell effects
+        - "outlier_fraction": Fraction of cells with extreme effects (>2 SD from median)
+        """
+        import pyro
+        from pyro import distributions as dist
+        from pyro.infer import Predictive
+        from scvi import REGISTRY_KEYS
+        
+        adata = self._validate_anndata(adata)
+        
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+            
+        # Ensure the entire module is on the correct device before any operations
+        _, _, device = parse_device_args(
+            "auto", "auto", return_device="torch", validate_single_device=True
+        )
+        if next(self.module.parameters()).device != device:
+            self.module = self.module.to(device)
+
+        # Get per-cell effects without summarizing
+        z_fixed = self.get_latent_representation(
+            adata=adata, indices=indices, give_mean=True, batch_size=batch_size
+        )
+        z_fixed = torch.from_numpy(z_fixed).to(device)
+        
+        # Check perturbation setup
+        perturbation_idx = self.module.model.perturbation_idx
+        if perturbation_idx is None:
+            raise ValueError("No perturbation found in categorical covariates.")
+            
+        n_perturbs = self.module.model.n_perturbs
+        if perturbation_list is None:
+            if n_perturbs <= 1:
+                raise ValueError(f"Model has {n_perturbs} perturbations, need at least 2 (including control)")
+            perturbation_list = list(range(1, n_perturbs))
+            
+        gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+        
+        # Create data loader for getting other necessary tensors
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        
+        all_counterfactual_counts = []
+        baseline_perturbation = None
+        
+        for tensors in scdl:
+            _, kwargs = self.module._get_fn_args_from_batch(tensors)
+            kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
+            
+            batch_size_actual = kwargs["x"].shape[0]
+            z_batch = z_fixed[:batch_size_actual, :]
+            
+            if kwargs["cat_covs"] is not None:
+                original_perturbs = kwargs["cat_covs"][:, perturbation_idx]
+                actual_baseline_perturb = original_perturbs[0].item()
+            else:
+                actual_baseline_perturb = 0
+            
+            perturbation_counts = {}
+            baseline_perturb = actual_baseline_perturb
+            if baseline_perturbation is None:
+                baseline_perturbation = baseline_perturb
+            
+            all_perturb_vals = [baseline_perturb] + [p for p in perturbation_list if p != baseline_perturb]
+            
+            for perturb_val in all_perturb_vals:
+                if kwargs["cat_covs"] is not None:
+                    cat_covs_modified = kwargs["cat_covs"].clone()
+                    cat_covs_modified[:, perturbation_idx] = perturb_val
+                else:
+                    cat_covs_modified = torch.zeros(
+                        (batch_size_actual, perturbation_idx + 1), 
+                        device=device, dtype=torch.long
+                    )
+                    cat_covs_modified[:, perturbation_idx] = perturb_val
+                
+                model_kwargs = kwargs.copy()
+                model_kwargs["cat_covs"] = cat_covs_modified
+                
+                def single_perturbation_model():
+                    with pyro.condition(data={"latent": z_batch}):
+                        self.module.model_corrected(**model_kwargs)
+                
+                predictive = Predictive(
+                    single_perturbation_model,
+                    num_samples=n_samples,
+                    return_sites=["mean_poisson"]
+                )
+                
+                counterfactual_samples = predictive()
+                counts = counterfactual_samples["mean_poisson"]  # [n_samples, batch_size, n_genes]
+                
+                perturbation_counts[perturb_val] = counts
+                
+            all_counterfactual_counts.append(perturbation_counts)
+        
+        # Concatenate results across batches
+        baseline_key = baseline_perturbation if baseline_perturbation is not None else 0
+        control_counts = torch.cat([batch[baseline_key] for batch in all_counterfactual_counts], dim=1)
+        
+        heterogeneity_metrics = {}
+        
+        for perturb_idx in perturbation_list:
+            perturb_counts = torch.cat([batch[perturb_idx] for batch in all_counterfactual_counts], dim=1)
+            
+            # Compute log fold change per cell per sample
+            eps = 1e-8
+            control_safe = torch.clamp(control_counts, min=eps)
+            perturb_safe = torch.clamp(perturb_counts, min=eps)
+            
+            log_fc = torch.log2(perturb_safe / control_safe)  # [n_samples, n_cells, n_genes]
+            log_fc = log_fc[..., gene_mask]
+            log_fc_np = log_fc.cpu().numpy()
+            
+            # Compute heterogeneity metrics for each gene
+            n_genes = log_fc_np.shape[-1]
+            
+            # 1. Coefficient of variation of per-cell effects within each sample
+            cv_per_sample = []
+            for sample_idx in range(n_samples):
+                sample_effects = log_fc_np[sample_idx, :, :]  # [n_cells, n_genes]
+                cv = np.abs(np.std(sample_effects, axis=0) / (np.mean(sample_effects, axis=0) + eps))
+                cv_per_sample.append(cv)
+            cv_per_sample = np.array(cv_per_sample)  # [n_samples, n_genes]
+            mean_cv = np.mean(cv_per_sample, axis=0)  # [n_genes]
+            
+            # 2. Fraction of cells responding (|effect| > 0.1 log2FC)
+            responding_cells = []
+            for sample_idx in range(n_samples):
+                sample_effects = log_fc_np[sample_idx, :, :]  # [n_cells, n_genes]
+                frac_responding = np.mean(np.abs(sample_effects) > 0.1, axis=0)  # [n_genes]
+                responding_cells.append(frac_responding)
+            responding_cells = np.array(responding_cells)  # [n_samples, n_genes]
+            mean_responding = np.mean(responding_cells, axis=0)  # [n_genes]
+            
+            # 3. Difference between median and mean (measure of skewness)
+            median_vs_mean_diff = []
+            for sample_idx in range(n_samples):
+                sample_effects = log_fc_np[sample_idx, :, :]  # [n_cells, n_genes]
+                medians = np.median(sample_effects, axis=0)  # [n_genes]
+                means = np.mean(sample_effects, axis=0)  # [n_genes]
+                diff = np.abs(medians - means)  # [n_genes]
+                median_vs_mean_diff.append(diff)
+            median_vs_mean_diff = np.array(median_vs_mean_diff)  # [n_samples, n_genes]
+            mean_median_mean_diff = np.mean(median_vs_mean_diff, axis=0)  # [n_genes]
+            
+            # 4. Fraction of outlier cells (>2 SD from median)
+            outlier_fractions = []
+            for sample_idx in range(n_samples):
+                sample_effects = log_fc_np[sample_idx, :, :]  # [n_cells, n_genes]
+                medians = np.median(sample_effects, axis=0)  # [n_genes]
+                mads = np.median(np.abs(sample_effects - medians[None, :]), axis=0)  # [n_genes]
+                # Use MAD-based outlier detection (more robust than SD)
+                outliers = np.abs(sample_effects - medians[None, :]) > (2.5 * mads[None, :])  # [n_cells, n_genes]
+                frac_outliers = np.mean(outliers, axis=0)  # [n_genes]
+                outlier_fractions.append(frac_outliers)
+            outlier_fractions = np.array(outlier_fractions)  # [n_samples, n_genes]
+            mean_outlier_frac = np.mean(outlier_fractions, axis=0)  # [n_genes]
+            
+            heterogeneity_metrics[f"perturbation_{perturb_idx}"] = {
+                "cell_response_variability": mean_cv,
+                "fraction_responding_cells": mean_responding,
+                "median_vs_mean_difference": mean_median_mean_diff,
+                "outlier_fraction": mean_outlier_frac,
+            }
+        
+        # Format results
+        if return_numpy is None or return_numpy is False:
+            gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
+            
+            formatted_results = {}
+            for perturb_name, metrics in heterogeneity_metrics.items():
+                formatted_results[perturb_name] = {}
+                for metric_name, metric_values in metrics.items():
+                    formatted_results[perturb_name][metric_name] = pd.Series(
+                        metric_values, index=gene_names, name=metric_name
+                    )
+            
+            return formatted_results
+        else:
+            return heterogeneity_metrics

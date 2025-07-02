@@ -31,3 +31,4 @@ __pycache__/
 /node_modules/
 
 /resolve_perurb_tests/supervised_resolvi.model/*
+/resolve_perurb_tests/perturb_model.model/*

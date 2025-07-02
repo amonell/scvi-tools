@@ -31,6 +31,33 @@ from scvi.nn import DecoderSCVI, Encoder
 _RESOLVAE_PYRO_MODULE_NAME = "resolvae"
 
 
+def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Safely compute log1p(x / mean(x)) with numerical stability checks.
+    
+    Parameters
+    ----------
+    x
+        Input tensor
+    dim
+        Dimension along which to compute mean
+    keepdim
+        Whether to keep the dimension
+    eps
+        Small epsilon to prevent division by zero
+        
+    Returns
+    -------
+    Normalized and log-transformed tensor with invalid values replaced by zeros.
+    """
+    x_mean = torch.mean(x, dim=dim, keepdim=keepdim)
+    x_mean_safe = torch.clamp(x_mean, min=eps)
+    x_normalized = x / x_mean_safe
+    x_log = torch.log1p(x_normalized)
+    # Handle any remaining invalid values (NaN, inf)
+    return torch.where(torch.isfinite(x_log), x_log, torch.zeros_like(x_log))
+
+
 class RESOLVAEModel(PyroModule):
     """A PyroModule that serves as the model for the RESOLVAE class.
 
@@ -496,11 +523,12 @@ class RESOLVAEModel(PyroModule):
                 else:
                     categorical_encoder = ()
 
+                # Add numerical stability for neighboring cell processing
+                x_n_log = _safe_log_norm(x_n)
+                x_n_input = torch.reshape(x_n_log, (x.shape[0] * self.n_neighbors, x.shape[1]))
+                
                 qz_m_n, qz_v_n, _ = self.z_encoder(
-                    torch.reshape(
-                        torch.log1p(x_n / torch.mean(x_n, dim=1, keepdim=True)),
-                        (x.shape[0] * self.n_neighbors, x.shape[1]),
-                    ),
+                    x_n_input,
                     batch_index.repeat_interleave(self.n_neighbors).unsqueeze(1),
                     *categorical_encoder,
                 )
@@ -893,7 +921,7 @@ class RESOLVAEGuide(PyroModule):
 
         if self.downsample_counts_mean is not None:
             downsample_counts = (
-                int(LogNormal(self.downsample_counts_mean, self.downsample_counts_std).sample())
+                int(LogNormal(float(self.downsample_counts_mean), float(self.downsample_counts_std)).sample())
                 + 10
             )
 
@@ -940,8 +968,11 @@ class RESOLVAEGuide(PyroModule):
                 # use the encoder to get the parameters used to define q(z|x)
                 if self.training and self.downsample_counts_mean is not None:
                     x = Multinomial(total_count=downsample_counts, probs=x).sample()
+                # Add numerical stability
+                x_log = _safe_log_norm(x)
+                
                 qz_m, qz_v, _ = self.z_encoder(
-                    torch.log1p(x / torch.mean(x, dim=1, keepdim=True)),
+                    x_log,
                     batch_index,
                     *categorical_input,
                 )
