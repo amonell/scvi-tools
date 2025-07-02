@@ -448,7 +448,6 @@ class RESOLVAEModel(PyroModule):
             
             # --- Add perturbation shift onto the true channel ---
             if self.perturbation_idx is not None and cat_covs is not None:
-                print("--- Debugging Perturbation Shift ---")
                 # Extract perturbation index from categorical covariates
                 px_rate_pre_shift = px_rate.clone()
                 perturb_idx = cat_covs[:, self.perturbation_idx].long()
@@ -462,28 +461,16 @@ class RESOLVAEModel(PyroModule):
                 
                 delta = self.shift_net(torch.cat([z, u_k], dim=-1))   # → (n_cells, n_genes) or (n_particles, n_cells, n_genes)
                 
-                print(f"Decoder px_rate (before shift) stats: mean={px_rate_pre_shift.mean().item():.4f}, std={px_rate_pre_shift.std().item():.4f}, min={px_rate_pre_shift.min().item():.4f}, max={px_rate_pre_shift.max().item():.4f}")
-                print(f"Shift net delta stats: mean={delta.mean().item():.4f}, std={delta.std().item():.4f}, min={delta.min().item():.4f}, max={delta.max().item():.4f}")
-
                 # Only add shift for non-zero perturbation indices (assuming 0 = control)
                 mask  = (perturb_idx != 0).float().unsqueeze(-1)   # 1 → perturbed, 0 → control
                 if z.ndim == 3:                                    # particles dimension
                     mask = mask.unsqueeze(0)
                 
-                if torch.any(mask > 0):
-                    print(f"Applying shift for {int(torch.sum(mask > 0))} perturbed cells out of {len(mask.flatten())} cells.")
-                else:
-                    print("No perturbed cells in this batch, no shift applied.")
-
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
                 # This ensures λ > 0 even with negative δ
                 log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
                 log_px_rate = log_px_rate_base + mask * delta
                 px_rate = torch.exp(log_px_rate)
-                
-                print(f"Log px_rate (base) stats: mean={log_px_rate_base.mean().item():.4f}, std={log_px_rate_base.std().item():.4f}, min={log_px_rate_base.min().item():.4f}, max={log_px_rate_base.max().item():.4f}")
-                print(f"Log px_rate (after shift) stats: mean={log_px_rate.mean().item():.4f}, std={log_px_rate.std().item():.4f}, min={log_px_rate.min().item():.4f}, max={log_px_rate.max().item():.4f}")
-                print(f"Decoder px_rate (after exp) stats: mean={px_rate.mean().item():.4f}, std={px_rate.std().item():.4f}, min={px_rate.min().item():.4f}, max={px_rate.max().item():.4f}")
 
             if self.semisupervised:
                 probs_prediction_ = self.classifier(z)
@@ -571,10 +558,6 @@ class RESOLVAEModel(PyroModule):
                     .rsample()
                 )
 
-            if self.perturbation_idx is not None and cat_covs is not None:
-                print(f"mean_nb stats: mean={mean_nb.mean().item():.4f}, std={mean_nb.std().item():.4f}, min={mean_nb.min().item():.4f}, max={mean_nb.max().item():.4f}")
-                print(f"background stats: mean={background.mean().item():.4f}, std={background.std().item():.4f}, min={background.min().item():.4f}, max={background.max().item():.4f}")
-
             mean_poisson = pyro.deterministic(
                 "mean_poisson",
                 mean_nb + background,
@@ -583,10 +566,6 @@ class RESOLVAEModel(PyroModule):
 
             # Sample count distribution
             pyro.sample("obs", Poisson(mean_poisson + 1e-9).to_event(1))
-
-            if self.perturbation_idx is not None and cat_covs is not None:
-                print(f"Final mean_poisson stats: mean={mean_poisson.mean().item():.4f}, std={mean_poisson.std().item():.4f}, min={mean_poisson.min().item():.4f}, max={mean_poisson.max().item():.4f}")
-                print("--------------------------------------")
 
             if self.semisupervised:
                 probs_prediction = pyro.deterministic(

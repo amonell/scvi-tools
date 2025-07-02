@@ -75,12 +75,6 @@ class ResolVIPredictiveMixin:
                 if v is not None and hasattr(v, 'to') and hasattr(v, 'device'):
                     kwargs[k] = v.to(device)
 
-            # Debug: print tensor devices
-            print(f"Debug - device target: {device}")
-            for k, v in kwargs.items():
-                if v is not None and hasattr(v, 'device'):
-                    print(f"Debug - {k} device: {v.device}")
-
             if kwargs["cat_covs"] is not None and self.module.encode_covariates:
                 categorical_input = list(torch.split(kwargs["cat_covs"], 1, dim=1))
             else:
@@ -94,23 +88,14 @@ class ResolVIPredictiveMixin:
             x_input = x_input.to(device)
             batch_input = batch_input.to(device)
             categorical_input = [c.to(device) for c in categorical_input]
-            
-            print(f"Debug - x_input device: {x_input.device}")
-            print(f"Debug - batch_input device: {batch_input.device}")
-            print(f"Debug - categorical_input devices: {[c.device for c in categorical_input]}")
 
             # Check and ensure encoder is on correct device
-            print(f"Debug - z_encoder device: {next(self.module.z_encoder.parameters()).device}")
             if next(self.module.z_encoder.parameters()).device != device:
-                print(f"Debug - Moving z_encoder to {device}")
                 self.module.z_encoder = self.module.z_encoder.to(device)
-                print(f"Debug - z_encoder device after move: {next(self.module.z_encoder.parameters()).device}")
 
             # Also ensure the entire module is on the correct device
             if next(self.module.parameters()).device != device:
-                print(f"Debug - Moving entire module to {device}")
                 self.module = self.module.to(device)
-                print(f"Debug - Module device after move: {next(self.module.parameters()).device}")
 
             qz_m, qz_v, z = self.module.z_encoder(
                 x_input,
@@ -535,7 +520,25 @@ class ResolVIPredictiveMixin:
         if indices is None:
             indices = np.arange(adata.n_obs)
             
-        # Get the perturbation index from categorical covariates
+        # Ensure the entire module is on the correct device before any operations
+        _, _, device = parse_device_args(
+            "auto", "auto", return_device="torch", validate_single_device=True
+        )
+        if next(self.module.parameters()).device != device:
+            self.module = self.module.to(device)
+
+        # Step 1: Fix latent representations using trained posterior
+        z_fixed = self.get_latent_representation(
+            adata=adata, indices=indices, give_mean=True, batch_size=batch_size
+        )
+        
+        # Convert to tensor 
+        _, _, device = parse_device_args(
+            "auto", "auto", return_device="torch", validate_single_device=True
+        )
+        z_fixed = torch.from_numpy(z_fixed).to(device)
+        
+        # Check perturbation setup
         perturbation_idx = self.module.model.perturbation_idx
         if perturbation_idx is None:
             raise ValueError(
@@ -571,32 +574,7 @@ class ResolVIPredictiveMixin:
                 )
             return_numpy = True
 
-        # Ensure the entire module is on the correct device before any operations
-        _, _, device = parse_device_args(
-            "auto", "auto", return_device="torch", validate_single_device=True
-        )
-        if next(self.module.parameters()).device != device:
-            print(f"Debug - Moving entire module to {device} at start of get_perturbation_effects")
-            self.module = self.module.to(device)
-            print(f"Debug - Module device after move: {next(self.module.parameters()).device}")
-
-        # Step 1: Fix latent representations using trained posterior
-        z_fixed = self.get_latent_representation(
-            adata=adata, indices=indices, give_mean=True, batch_size=batch_size
-        )
-        
-        # Convert to tensor 
-        _, _, device = parse_device_args(
-            "auto", "auto", return_device="torch", validate_single_device=True
-        )
-        z_fixed = torch.from_numpy(z_fixed).to(device)
-        
-        # Debug: Check perturbation setup
-        print(f"Debug: perturbation_idx = {perturbation_idx}, n_perturbs = {n_perturbs}")
-        print(f"Debug: perturbation_list = {perturbation_list}")
-        
-        # CRITICAL: Check what the actual perturbation categories are in the data
-        # We need to use the ACTUAL perturbation values, not just indices 0,1,2
+        # Check what the actual perturbation categories are in the data
         if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
             cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
             if hasattr(cat_state_registry, 'field_keys'):
@@ -606,27 +584,18 @@ class ResolVIPredictiveMixin:
                     
                     # Get the actual perturbation values from the original data
                     original_perturb_values = adata.obs[perturbation_key].cat.categories.tolist()
-                    print(f"Debug: Actual perturbation categories: {original_perturb_values}")
-                    
-                    # Get the current perturbation values in our selected cells
-                    current_perturb_values = adata[indices].obs[perturbation_key].unique()
-                    print(f"Debug: Perturbation values in selected cells: {current_perturb_values}")
                     
                     # Map category names to indices
                     perturb_name_to_idx = {name: idx for idx, name in enumerate(original_perturb_values)}
-                    print(f"Debug: Perturbation name to index mapping: {perturb_name_to_idx}")
                     
                     # The control should be index 0 (first category)
                     control_name = original_perturb_values[0]
-                    print(f"Debug: Control condition: '{control_name}' (index 0)")
                     
                     # Update perturbation_list to use actual meaningful perturbations
                     if perturbation_list == list(range(1, n_perturbs)):
                         # Default case - use all non-control perturbations
                         perturbation_list = list(range(1, len(original_perturb_values)))
-                        print(f"Debug: Updated perturbation_list to: {perturbation_list}")
                         treatment_names = [original_perturb_values[i] for i in perturbation_list]
-                        print(f"Debug: Treatment conditions: {treatment_names}")
         
         # Create data loader for getting other necessary tensors
         scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
@@ -641,20 +610,15 @@ class ResolVIPredictiveMixin:
             batch_size_actual = kwargs["x"].shape[0]
             z_batch = z_fixed[:batch_size_actual, :]  # Use fixed z for this batch
             
-            # Debug: Check original perturbation values in this batch
+            # If all cells are from the same perturbation condition,
+            # we should use THAT as our baseline, not force it to 0
             if kwargs["cat_covs"] is not None:
                 original_perturbs = kwargs["cat_covs"][:, perturbation_idx]
-                print(f"Debug: Original perturbation values in batch: {original_perturbs.unique()}")
-                
-                # IMPORTANT: If all cells are from the same perturbation condition,
-                # we should use THAT as our baseline, not force it to 0
                 actual_baseline_perturb = original_perturbs[0].item()  # All cells should have same perturbation
-                print(f"Debug: Actual baseline perturbation for these cells: {actual_baseline_perturb}")
             else:
-                print("Debug: No cat_covs found in batch")
                 actual_baseline_perturb = 0
             
-            # Generate counterfactual counts for each perturbation separately (easier to debug)
+            # Generate counterfactual counts for each perturbation separately
             perturbation_counts = {}
             
             # Use the ACTUAL baseline perturbation of these cells, plus other perturbations to compare
@@ -663,18 +627,12 @@ class ResolVIPredictiveMixin:
                 baseline_perturbation = baseline_perturb  # Store for later use
             
             all_perturb_vals = [baseline_perturb] + [p for p in perturbation_list if p != baseline_perturb]
-            print(f"Debug: Will generate counterfactuals for perturbations: {all_perturb_vals}")
-            print(f"Debug: Baseline (control): {baseline_perturb}, Treatments: {[p for p in perturbation_list if p != baseline_perturb]}")
             
             for perturb_val in all_perturb_vals:
-                print(f"Debug: Generating counterfactuals for perturbation {perturb_val}")
-                
                 # Create modified cat_covs with this specific perturbation
                 if kwargs["cat_covs"] is not None:
                     cat_covs_modified = kwargs["cat_covs"].clone()
                     cat_covs_modified[:, perturbation_idx] = perturb_val
-                    print(f"Debug: Modified cat_covs perturbation column to {perturb_val}")
-                    print(f"Debug: cat_covs_modified[:, {perturbation_idx}] = {cat_covs_modified[:, perturbation_idx].unique()}")
                 else:
                     # Create cat_covs if it doesn't exist
                     cat_covs_modified = torch.zeros(
@@ -682,7 +640,6 @@ class ResolVIPredictiveMixin:
                         device=device, dtype=torch.long
                     )
                     cat_covs_modified[:, perturbation_idx] = perturb_val
-                    print(f"Debug: Created new cat_covs with perturbation {perturb_val}")
                 
                 # Create model kwargs with modified perturbations
                 model_kwargs = kwargs.copy()
@@ -704,29 +661,17 @@ class ResolVIPredictiveMixin:
                 counterfactual_samples = predictive()
                 counts = counterfactual_samples["mean_poisson"]  # [n_samples, batch_size, n_genes]
                 
-                print(f"Debug: Generated counts shape for perturbation {perturb_val}: {counts.shape}")
-                print(f"Debug: Sample mean counts: {counts.mean().item():.3f}")
-                
                 perturbation_counts[perturb_val] = counts
                 
             all_counterfactual_counts.append(perturbation_counts)
         
         # Concatenate results across batches - use the actual baseline perturbation
         baseline_key = baseline_perturbation if baseline_perturbation is not None else 0
-        print(f"Debug: Using baseline perturbation {baseline_key} as control")
         control_counts = torch.cat([batch[baseline_key] for batch in all_counterfactual_counts], dim=1)  # [n_samples, total_cells, n_genes]
-        
-        print(f"Debug: Control counts shape: {control_counts.shape}")
-        print(f"Debug: Control counts mean: {control_counts.mean().item():.3f}")
-        print(f"Debug: Control counts range: {control_counts.min().item():.3f} - {control_counts.max().item():.3f}")
         
         perturbation_effects = []
         for perturb_idx in perturbation_list:
             perturb_counts = torch.cat([batch[perturb_idx] for batch in all_counterfactual_counts], dim=1)  # [n_samples, total_cells, n_genes]
-            
-            print(f"Debug: Perturbation {perturb_idx} counts shape: {perturb_counts.shape}")
-            print(f"Debug: Perturbation {perturb_idx} counts mean: {perturb_counts.mean().item():.3f}")
-            print(f"Debug: Perturbation {perturb_idx} counts range: {perturb_counts.min().item():.3f} - {perturb_counts.max().item():.3f}")
             
             # Compute log fold change on actual counts
             eps = 1e-8
@@ -734,11 +679,6 @@ class ResolVIPredictiveMixin:
             perturb_safe = torch.clamp(perturb_counts, min=eps)
             
             log_fc = torch.log2(perturb_safe / control_safe)  # [n_samples, total_cells, n_genes]
-            
-            print(f"Debug: Log fold change for perturbation {perturb_idx}:")
-            print(f"  - Mean: {log_fc.mean().item():.3f}")
-            print(f"  - Range: {log_fc.min().item():.3f} - {log_fc.max().item():.3f}")
-            print(f"  - Std: {log_fc.std().item():.3f}")
             
             log_fc = log_fc[..., gene_mask]
             
