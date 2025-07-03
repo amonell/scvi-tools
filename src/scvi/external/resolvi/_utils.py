@@ -577,7 +577,7 @@ class ResolVIPredictiveMixin:
             - "prob_negative": Probability that effect is negative
             - "prob_significant": Probability that |effect| > threshold
         alpha
-            Significance threshold for prob_significant (default 0.05 corresponds to ~1.4 log2FC).
+            Significance threshold for prob_significant (default 0.05 log2FC ≈ 1.4x fold change)
         cell_summary_fn
             Function to summarize per-cell effects within each posterior sample.
             Options: "median", "mean", "trimmed_mean". 
@@ -916,9 +916,12 @@ class ResolVIPredictiveMixin:
         cell_summary_fn: str = "median",
         preserve_cell_heterogeneity: bool = True,
         show_progress: bool = True,
+        correct_multiple_testing: bool = True,
+        correction_method: str = "fdr_bh", 
+        alpha: float = 0.05,
     ) -> pd.DataFrame | np.ndarray:
         """
-        Compute empirical p-values for perturbation effects.
+        Compute empirical p-values for perturbation effects with optional multiple testing correction.
         
         This method computes p-values by treating posterior samples as replicates
         and testing whether the log fold change is significantly different from zero.
@@ -951,10 +954,29 @@ class ResolVIPredictiveMixin:
             If True, computes cell-level uncertainty before pooling for more robust p-values.
         show_progress
             If True, displays progress bars for effect computation and p-value calculation.
+        correct_multiple_testing
+            If True, applies multiple testing correction. **Highly recommended for genomics data**.
+        correction_method
+            Multiple testing correction method. Options:
+            - "fdr_bh": Benjamini-Hochberg FDR (recommended for genomics)
+            - "fdr_by": Benjamini-Yekutieli FDR (for dependent tests)
+            - "bonferroni": Bonferroni correction (very conservative)
+            - "holm": Holm-Bonferroni (less conservative than Bonferroni)
+        alpha
+            Significance threshold for multiple testing correction.
             
         Returns
         -------
-        P-values for each perturbation-gene combination.
+        If correct_multiple_testing=False:
+            P-values for each perturbation-gene combination (raw, uncorrected).
+        If correct_multiple_testing=True:
+            Dictionary containing:
+            - "pvalues_raw": Raw uncorrected p-values
+            - "pvalues_corrected": Multiple testing corrected p-values  
+            - "is_significant": Boolean mask of genes passing correction at alpha level
+            - "correction_method": Method used for correction
+            - "alpha": Significance threshold used
+            - "n_significant": Number of significant genes after correction
         """
         from scipy import stats
         
@@ -1009,23 +1031,145 @@ class ResolVIPredictiveMixin:
             pvalues[perturb_idx, gene_idx] = pval
         
         # Format results
+        adata = self._validate_anndata(adata)
+        gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+        gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
+        
+        # Get perturbation names
+        if perturbation_list is None:
+            n_perturbs_total = self.module.model.n_perturbs
+            perturbation_list = list(range(1, n_perturbs_total))
+        
+        perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
+        
         if return_numpy is None or return_numpy is False:
-            adata = self._validate_anndata(adata)
-            gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
-            gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
-            
-            # Get perturbation names
-            if perturbation_list is None:
-                n_perturbs_total = self.module.model.n_perturbs
-                perturbation_list = list(range(1, n_perturbs_total))
-            
-            perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
-            
-            return pd.DataFrame(
+            pvalues_df = pd.DataFrame(
                 pvalues, index=perturbation_names, columns=gene_names
             )
         else:
-            return pvalues
+            pvalues_df = pvalues
+            
+        # Apply multiple testing correction if requested
+        if correct_multiple_testing:
+            if show_progress:
+                print(f"Applying multiple testing correction ({correction_method})...")
+                
+            corrected_results = self.correct_pvalues(
+                pvalues_df, 
+                method=correction_method, 
+                alpha=alpha,
+                return_numpy=return_numpy
+            )
+            
+            if show_progress:
+                n_significant = corrected_results.get('n_significant', 0)
+                print(f"Found {n_significant} significant genes after {correction_method} correction at α={alpha}")
+                
+            return corrected_results
+        else:
+            if show_progress:
+                print("⚠️  WARNING: No multiple testing correction applied!")
+                print("   For genomics data, consider setting correct_multiple_testing=True")
+                
+            return pvalues_df
+
+    def correct_pvalues(
+        self,
+        pvalues: pd.DataFrame | np.ndarray,
+        method: str = "fdr_bh",
+        alpha: float = 0.05,
+        return_numpy: bool = False,
+    ) -> dict:
+        """
+        Apply multiple testing correction to p-values.
+        
+        This is a utility function that can be used to correct p-values from any source,
+        not just get_perturbation_pvalues().
+        
+        Parameters
+        ----------
+        pvalues
+            P-values to correct. Can be DataFrame or numpy array.
+        method
+            Multiple testing correction method:
+            - "fdr_bh": Benjamini-Hochberg FDR (recommended)
+            - "fdr_by": Benjamini-Yekutieli FDR (for dependent tests)
+            - "bonferroni": Bonferroni correction
+            - "holm": Holm-Bonferroni correction
+        alpha
+            Significance threshold.
+        return_numpy
+            Return numpy arrays instead of DataFrames.
+            
+        Returns
+        -------
+        Dictionary containing:
+        - "pvalues_raw": Original uncorrected p-values
+        - "pvalues_corrected": Corrected p-values
+        - "is_significant": Boolean mask of significant results
+        - "correction_method": Method used
+        - "alpha": Threshold used
+        - "n_significant": Number of significant results
+        """
+        try:
+            from statsmodels.stats.multitest import multipletests
+        except ImportError:
+            raise ImportError(
+                "statsmodels is required for multiple testing correction. "
+                "Install with: pip install statsmodels"
+            )
+        
+        # Handle input format
+        if isinstance(pvalues, pd.DataFrame):
+            pvals_flat = pvalues.values.flatten()
+            original_shape = pvalues.shape
+            index = pvalues.index
+            columns = pvalues.columns
+        else:
+            pvals_flat = pvalues.flatten()
+            original_shape = pvalues.shape
+            index = None
+            columns = None
+        
+        # Apply correction
+        reject, pvals_corrected, alpha_sidak, alpha_bonf = multipletests(
+            pvals_flat, alpha=alpha, method=method
+        )
+        
+        # Reshape back to original format
+        pvals_corrected = pvals_corrected.reshape(original_shape)
+        reject = reject.reshape(original_shape)
+        
+        # Format output
+        if not return_numpy and index is not None and columns is not None:
+            # DataFrame output
+            results = {
+                "pvalues_raw": pvalues,
+                "pvalues_corrected": pd.DataFrame(
+                    pvals_corrected, index=index, columns=columns
+                ),
+                "is_significant": pd.DataFrame(
+                    reject, index=index, columns=columns
+                ),
+            }
+        else:
+            # Numpy output
+            results = {
+                "pvalues_raw": pvalues if isinstance(pvalues, np.ndarray) else pvalues.values,
+                "pvalues_corrected": pvals_corrected,
+                "is_significant": reject,
+            }
+        
+        # Add metadata
+        results.update({
+            "correction_method": method,
+            "alpha": alpha,
+            "n_significant": int(reject.sum()),
+            "alpha_sidak": alpha_sidak,
+            "alpha_bonferroni": alpha_bonf,
+        })
+        
+        return results
 
     @torch.inference_mode()
     def analyze_perturbation_heterogeneity(
@@ -1247,3 +1391,592 @@ class ResolVIPredictiveMixin:
             return formatted_results
         else:
             return heterogeneity_metrics
+
+    @torch.inference_mode()
+    def get_perturbation_de(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        perturbation_list: Sequence[int] | None = None,
+        gene_list: Sequence[str] | None = None,
+        mode: str = "change",
+        delta: float = 0.25,
+        fdr_target: float = 0.05,
+        n_samples: int = 200,
+        batch_size: int | None = None,
+        cell_summary_fn: str = "median",
+        preserve_cell_heterogeneity: bool = True,
+        use_mixture_posterior: bool = True,
+        show_progress: bool = True,
+        return_numpy: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Perform Bayesian differential expression testing for perturbations.
+        
+        This method implements the same statistical framework as scVI's differential_expression()
+        but adapted for perturbation analysis using counterfactual inference.
+        
+        Implements two testing modes:
+        1. "vanilla": H0: βg = 0 vs H1: βg ≠ 0 (point-null hypothesis)
+        2. "change": H0: |βg| ≤ δ vs H1: |βg| > δ (thresholded-null hypothesis)
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        perturbation_list
+            List of perturbation indices to compare. If `None`, uses all non-control perturbations.
+        gene_list
+            Return DE results for a subset of genes. If `None`, all genes are used.
+        mode
+            Testing mode:
+            - "vanilla": Point-null hypothesis testing using Bayes factors
+            - "change": Thresholded-null hypothesis using probability of significant change
+        delta
+            Effect size threshold for change mode (log2 fold change units).
+        fdr_target
+            Target false discovery rate for Bayesian FDR control.
+        n_samples
+            Number of posterior samples for Bayesian testing. More samples = more precise estimates.
+        batch_size
+            Minibatch size for data loading into model.
+        cell_summary_fn
+            Function to summarize per-cell effects within each posterior sample.
+            Options: "median", "mean", "trimmed_mean".
+        preserve_cell_heterogeneity
+            If True, computes cell-level effects before pooling for more robust testing.
+        use_mixture_posterior
+            If True, uses mixture posterior sampling like scVI. If False, uses fixed latent representations.
+        show_progress
+            If True, displays progress bars for effect computation and testing.
+        return_numpy
+            Return numpy arrays instead of pandas DataFrames.
+            
+        Returns
+        -------
+        DataFrame with differential expression results containing:
+        - perturbation: Perturbation identifier
+        - gene: Gene identifier  
+        - effect_size: Posterior mean log2 fold change
+        - effect_std: Posterior standard deviation of log2 fold change
+        - effect_median: Posterior median log2 fold change
+        - bayes_factor: Log Bayes factor (vanilla mode only)
+        - proba_de: Probability of differential expression (change mode only)
+        - proba_positive: Probability that effect > 0
+        - proba_negative: Probability that effect < 0
+        - is_de_fdr: Whether gene passes Bayesian FDR control at target level
+        """
+        if mode not in ["vanilla", "change"]:
+            raise ValueError(f"mode must be 'vanilla' or 'change', got {mode}")
+            
+        adata = self._validate_anndata(adata)
+        
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+            
+        # Check perturbation setup
+        perturbation_idx = self.module.model.perturbation_idx
+        if perturbation_idx is None:
+            raise ValueError(
+                "No perturbation found in categorical covariates. "
+                "To enable perturbation analysis, you need to:\n"
+                "1. Call RESOLVI.setup_anndata() with perturbation_key parameter\n"
+                "2. Specify which column in adata.obs contains perturbation categories\n"
+                "3. Recreate the RESOLVI model"
+            )
+            
+        n_perturbs = self.module.model.n_perturbs
+        if perturbation_list is None:
+            if n_perturbs <= 1:
+                raise ValueError(f"Model has {n_perturbs} perturbations, need at least 2 (including control)")
+            perturbation_list = list(range(1, n_perturbs))
+            
+        gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+        
+        # Get posterior samples of log fold changes
+        if show_progress:
+            print(f"Computing posterior samples for Bayesian testing (mode={mode})...")
+            
+        if use_mixture_posterior:
+            # Use mixture posterior sampling like scVI (more rigorous)
+            effects = self._get_perturbation_effects_mixture_posterior(
+                adata=adata,
+                indices=indices,
+                perturbation_list=perturbation_list,
+                gene_list=gene_list,
+                n_samples=n_samples,
+                batch_size=batch_size,
+                cell_summary_fn=cell_summary_fn,
+                preserve_cell_heterogeneity=preserve_cell_heterogeneity,
+                show_progress=show_progress,
+            )
+        else:
+            # Use existing fixed latent approach (faster but less rigorous)
+            effects = self.get_perturbation_effects(
+                adata=adata,
+                indices=indices,
+                perturbation_list=perturbation_list,
+                gene_list=gene_list,
+                n_samples=n_samples,
+                batch_size=batch_size,
+                return_mean=False,
+                return_numpy=True,
+                return_uncertainty=False,
+                cell_summary_fn=cell_summary_fn,
+                preserve_cell_heterogeneity=preserve_cell_heterogeneity,
+                show_progress=show_progress,
+            )
+        
+        # effects shape: [n_samples, n_perturbs, n_genes]
+        if show_progress:
+            print(f"Running Bayesian hypothesis testing ({mode} mode)...")
+            
+        results = []
+        n_samples_actual, n_perturbs_actual, n_genes = effects.shape
+        
+        # Get gene and perturbation names
+        if gene_list is not None:
+            gene_names = adata.var_names[adata.var_names.isin(gene_list)].tolist()
+        else:
+            gene_names = adata.var_names.tolist()
+            
+        perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
+        
+        # Progress tracking for testing
+        total_tests = n_perturbs_actual * n_genes
+        if show_progress:
+            progress_iter = track(
+                range(total_tests),
+                description=f"Bayesian testing ({mode} mode): {n_perturbs_actual} perturbations × {n_genes} genes"
+            )
+        else:
+            progress_iter = range(total_tests)
+            
+        for test_idx in progress_iter:
+            perturb_idx = test_idx // n_genes
+            gene_idx = test_idx % n_genes
+            
+            # Get posterior samples for this perturbation-gene combination
+            samples = effects[:, perturb_idx, gene_idx]  # [n_samples]
+            
+            # Basic effect statistics
+            effect_mean = np.mean(samples)
+            effect_std = np.std(samples)
+            effect_median = np.median(samples)
+            
+            # Probability computations
+            prob_positive = np.mean(samples > 0)
+            prob_negative = np.mean(samples < 0)
+            
+            result = {
+                'perturbation': perturbation_names[perturb_idx],
+                'gene': gene_names[gene_idx],
+                'effect_size': effect_mean,
+                'effect_std': effect_std,
+                'effect_median': effect_median,
+                'proba_positive': prob_positive,
+                'proba_negative': prob_negative,
+            }
+            
+            if mode == "vanilla":
+                # Vanilla mode: H0: βg = 0 vs H1: βg ≠ 0
+                # Compute log Bayes factor: log(P(βg > 0) / P(βg ≤ 0))
+                if prob_negative > 1e-10:  # Avoid division by zero
+                    bayes_factor = np.log(prob_positive / prob_negative)
+                else:
+                    bayes_factor = np.log(prob_positive / 1e-10)  # Clip for numerical stability
+                    
+                result['bayes_factor'] = bayes_factor
+                
+            elif mode == "change":
+                # Change mode: H0: |βg| ≤ δ vs H1: |βg| > δ  
+                # Compute P(|βg| > δ | data)
+                prob_de = np.mean(np.abs(samples) > delta)
+                result['proba_de'] = prob_de
+                result['delta'] = delta
+            
+            results.append(result)
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(results)
+        
+        # Apply Bayesian FDR control
+        if show_progress:
+            print(f"Applying Bayesian FDR control (target={fdr_target})...")
+            
+        if mode == "change":
+            # Bayesian FDR control for change mode
+            df = df.sort_values('proba_de', ascending=False).reset_index(drop=True)
+            
+            # Bayesian FDR: find largest k such that Σ(1-pf)/k ≤ α
+            proba_de_vals = df['proba_de'].values
+            cumsum_fdr = np.cumsum(1 - proba_de_vals) / np.arange(1, len(df) + 1)
+            
+            # Find the largest k where FDR condition is satisfied
+            passing_indices = np.where(cumsum_fdr <= fdr_target)[0]
+            if len(passing_indices) > 0:
+                num_de = passing_indices[-1] + 1  # +1 because indices are 0-based
+            else:
+                num_de = 0
+            
+            # Mark significant genes
+            df['is_de_fdr'] = False
+            if num_de > 0:
+                df.iloc[:num_de, df.columns.get_loc('is_de_fdr')] = True
+                
+            df['fdr_target'] = fdr_target
+            df['n_de_fdr'] = num_de
+            
+        elif mode == "vanilla":
+            # For vanilla mode, sort by absolute Bayes factor
+            df['abs_bayes_factor'] = np.abs(df['bayes_factor'])
+            df = df.sort_values('abs_bayes_factor', ascending=False).reset_index(drop=True)
+            
+            # Simple threshold-based approach for vanilla mode
+            # (Could implement more sophisticated Bayesian FDR for Bayes factors)
+            bf_threshold = np.log(3)  # log(3) ≈ 1.1 corresponds to "substantial evidence"
+            df['is_de_bf'] = np.abs(df['bayes_factor']) > bf_threshold
+            df['bf_threshold'] = bf_threshold
+            
+        # Add summary statistics
+        if show_progress:
+            if mode == "change":
+                n_significant = df['is_de_fdr'].sum()
+                print(f"Found {n_significant} DE genes at FDR {fdr_target}")
+            else:
+                n_significant = df['is_de_bf'].sum()
+                print(f"Found {n_significant} DE genes with |BF| > {bf_threshold:.2f}")
+                
+        # Add metadata
+        df['mode'] = mode
+        df['n_samples'] = n_samples_actual
+        df['method'] = 'bayesian_perturbation_de'
+        
+        if return_numpy:
+            return df.values
+        else:
+            return df
+
+    def _get_perturbation_effects_mixture_posterior(
+        self,
+        adata: AnnData,
+        indices: Sequence[int],
+        perturbation_list: Sequence[int],
+        gene_list: Sequence[str] | None = None,
+        n_samples: int = 200,
+        batch_size: int | None = None,
+        cell_summary_fn: str = "median",
+        preserve_cell_heterogeneity: bool = True,
+        show_progress: bool = True,
+    ) -> np.ndarray:
+        """
+        Get perturbation effects using mixture posterior sampling like scVI.
+        
+        Instead of using fixed latent representations, this method:
+        1. Creates mixture posteriors for each condition like scVI: P̂_A(Z) = (1/|N_A|) Σ q_θ(z|x_n)
+        2. Samples paired latent representations from control vs perturbation conditions
+        3. Uses these for counterfactual inference
+        
+        This provides more rigorous uncertainty quantification by properly accounting
+        for variability in the latent representations.
+        
+        Returns
+        -------
+        Array of shape [n_samples, n_perturbs, n_genes] with log fold change samples
+        """
+        import pyro
+        from pyro.infer import Predictive
+        from scvi import REGISTRY_KEYS
+        
+        # Ensure device compatibility
+        _, _, device = parse_device_args(
+            "auto", "auto", return_device="torch", validate_single_device=True
+        )
+        if next(self.module.parameters()).device != device:
+            self.module = self.module.to(device)
+            
+        gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+        perturbation_idx = self.module.model.perturbation_idx
+        
+        # Get variational posteriors for all cells 
+        qz_means, qz_vars = self.get_latent_representation(
+            adata=adata, indices=indices, return_dist=True, batch_size=batch_size
+        )
+        qz_means = torch.from_numpy(qz_means).to(device)
+        qz_vars = torch.from_numpy(qz_vars).to(device)
+        
+        # Identify which cells belong to which perturbation condition
+        control_indices = np.arange(len(indices))  # Default: use all cells
+        if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+            cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+            if hasattr(cat_state_registry, 'field_keys'):
+                field_keys = cat_state_registry.field_keys
+                if perturbation_idx < len(field_keys):
+                    perturbation_key = field_keys[perturbation_idx]
+                    cell_perturbations = adata.obs.iloc[indices][perturbation_key].values
+                    
+                    # Find control condition (should be index 0)
+                    control_mask = cell_perturbations == 0
+                    control_indices = np.where(control_mask)[0]
+                    
+                    if len(control_indices) == 0:
+                        # If no explicit control cells, use the most common condition as baseline
+                        unique_vals, counts = np.unique(cell_perturbations, return_counts=True)
+                        control_val = unique_vals[np.argmax(counts)]
+                        control_mask = cell_perturbations == control_val
+                        control_indices = np.where(control_mask)[0]
+        
+        # Create data loader for getting model tensors
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        
+        all_effects = []
+        
+        # Progress tracking
+        if show_progress:
+            batch_progress = track(
+                enumerate(scdl),
+                total=len(scdl),
+                description=f"Mixture posterior sampling: {len(scdl)} batches × {n_samples} samples"
+            )
+        else:
+            batch_progress = enumerate(scdl)
+            
+        for batch_idx, tensors in batch_progress:
+            _, kwargs = self.module._get_fn_args_from_batch(tensors)
+            kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
+            
+            batch_size_actual = kwargs["x"].shape[0]
+            
+            # For each perturbation, generate counterfactual expressions
+            batch_effects = []
+            
+            for perturb_val in perturbation_list:
+                # Collect log fold changes across samples for this perturbation
+                perturbation_log_fcs = []
+                
+                for sample_idx in range(n_samples):
+                    # Sample latent representations from mixture posteriors for this batch
+                    control_latents = []
+                    perturb_latents = []
+                    
+                    for cell_idx in range(batch_size_actual):
+                        # Sample from control mixture posterior
+                        if len(control_indices) > 0:
+                            # Randomly select a control cell from the full dataset
+                            control_cell_idx = np.random.choice(control_indices)
+                            qz_m_control = qz_means[control_cell_idx]
+                            qz_v_control = qz_vars[control_cell_idx]
+                            z_control = torch.distributions.Normal(qz_m_control, qz_v_control.sqrt()).sample()
+                        else:
+                            # Fallback: sample from random cell
+                            random_cell_idx = np.random.choice(len(qz_means))
+                            qz_m = qz_means[random_cell_idx]
+                            qz_v = qz_vars[random_cell_idx]
+                            z_control = torch.distributions.Normal(qz_m, qz_v.sqrt()).sample()
+                        
+                        # For perturbation condition, use same latent (will be modified by perturbation network)
+                        z_perturb = z_control.clone()
+                        
+                        control_latents.append(z_control)
+                        perturb_latents.append(z_perturb)
+                    
+                    control_latents = torch.stack(control_latents)  # [batch_size, n_latent]
+                    perturb_latents = torch.stack(perturb_latents)  # [batch_size, n_latent]
+                    
+                    # Generate counterfactual expressions for control condition
+                    control_kwargs = kwargs.copy()
+                    if control_kwargs["cat_covs"] is not None:
+                        control_kwargs["cat_covs"] = control_kwargs["cat_covs"].clone()
+                        control_kwargs["cat_covs"][:, perturbation_idx] = 0  # Control condition
+                    else:
+                        control_kwargs["cat_covs"] = torch.zeros(
+                            (batch_size_actual, perturbation_idx + 1), 
+                            device=device, dtype=torch.long
+                        )
+                    
+                    def control_model():
+                        with pyro.condition(data={"latent": control_latents}):
+                            self.module.model_corrected(**control_kwargs)
+                    
+                    control_predictive = Predictive(
+                        control_model, num_samples=1, return_sites=["mean_poisson"]
+                    )
+                    control_samples = control_predictive()
+                    control_counts = control_samples["mean_poisson"][0]  # [1, batch_size, n_genes]
+                    control_counts = control_counts.squeeze(0)  # [batch_size, n_genes]
+                    
+                    # Generate counterfactual expressions for perturbation condition  
+                    perturb_kwargs = kwargs.copy()
+                    if perturb_kwargs["cat_covs"] is not None:
+                        perturb_kwargs["cat_covs"] = perturb_kwargs["cat_covs"].clone()
+                        perturb_kwargs["cat_covs"][:, perturbation_idx] = perturb_val
+                    else:
+                        perturb_kwargs["cat_covs"] = torch.zeros(
+                            (batch_size_actual, perturbation_idx + 1), 
+                            device=device, dtype=torch.long
+                        )
+                        perturb_kwargs["cat_covs"][:, perturbation_idx] = perturb_val
+                    
+                    def perturb_model():
+                        with pyro.condition(data={"latent": perturb_latents}):
+                            self.module.model_corrected(**perturb_kwargs)
+                    
+                    perturb_predictive = Predictive(
+                        perturb_model, num_samples=1, return_sites=["mean_poisson"]
+                    )
+                    perturb_samples = perturb_predictive()
+                    perturb_counts = perturb_samples["mean_poisson"][0]  # [1, batch_size, n_genes]
+                    perturb_counts = perturb_counts.squeeze(0)  # [batch_size, n_genes]
+                    
+                    # Compute log fold changes
+                    eps = 1e-8
+                    control_safe = torch.clamp(control_counts, min=eps)
+                    perturb_safe = torch.clamp(perturb_counts, min=eps)
+                    
+                    log_fc = torch.log2(perturb_safe / control_safe)  # [batch_size, n_genes]
+                    log_fc = log_fc[..., gene_mask]
+                    
+                    # Summarize across cells based on cell_summary_fn
+                    if preserve_cell_heterogeneity:
+                        if cell_summary_fn == "median":
+                            log_fc_summary = torch.median(log_fc, dim=0)[0]  # [n_genes]
+                        elif cell_summary_fn == "mean":
+                            log_fc_summary = log_fc.mean(dim=0)  # [n_genes]
+                        elif cell_summary_fn == "trimmed_mean":
+                            # Remove top and bottom 10% of cells, then take mean
+                            sorted_effects, _ = torch.sort(log_fc, dim=0)
+                            n_cells = log_fc.shape[0]
+                            trim_size = max(1, int(0.1 * n_cells))
+                            trimmed_effects = sorted_effects[trim_size:n_cells-trim_size, :]
+                            log_fc_summary = trimmed_effects.mean(dim=0)  # [n_genes]
+                        else:
+                            raise ValueError(f"Unknown cell_summary_fn: {cell_summary_fn}")
+                    else:
+                        log_fc_summary = log_fc.mean(dim=0)  # [n_genes]
+                    
+                    perturbation_log_fcs.append(log_fc_summary.cpu().numpy())
+                
+                # Stack samples for this perturbation
+                batch_effects.append(np.stack(perturbation_log_fcs, axis=0))  # [n_samples, n_genes]
+            
+            all_effects.append(np.stack(batch_effects, axis=1))  # [n_samples, n_perturbs, n_genes]
+        
+        # Average across batches (since we're sampling independently for each batch)
+        effects = np.stack(all_effects, axis=0).mean(axis=0)  # [n_samples, n_perturbs, n_genes]
+        
+        return effects
+
+def bayesian_perturbation_analysis_example():
+    """
+    Comprehensive example of using ResolVI's Bayesian differential expression testing.
+    
+    This example demonstrates how to use the new get_perturbation_de() method that
+    implements the same statistical rigor as scVI's differential expression analysis.
+    
+    Examples
+    --------
+    # Basic setup
+    >>> import scanpy as sc
+    >>> from scvi.external import RESOLVI
+    
+    # Setup ResolVI with perturbation data
+    >>> RESOLVI.setup_anndata(
+    ...     adata,
+    ...     perturbation_key='condition',  # Column with perturbation categories
+    ...     control_perturbation='Control'  # Control condition name
+    ... )
+    >>> model = RESOLVI(adata)
+    >>> model.train()
+    
+    # 1. Bayesian DE testing (recommended approach)
+    # Change mode: tests H0: |effect| ≤ δ vs H1: |effect| > δ
+    >>> de_results = model.get_perturbation_de(
+    ...     mode="change",           # Bayesian thresholded-null testing
+    ...     delta=0.25,             # Effect size threshold (log2 FC)
+    ...     fdr_target=0.05,        # Target false discovery rate
+    ...     n_samples=200,          # Posterior samples for testing
+    ...     use_mixture_posterior=True,  # Most rigorous (like scVI)
+    ... )
+    
+    # View significant genes
+    >>> significant_genes = de_results[de_results['is_de_fdr']]
+    >>> print(f"Found {len(significant_genes)} DE genes")
+    
+    # Vanilla mode: tests H0: βg = 0 vs H1: βg ≠ 0  
+    >>> de_results_vanilla = model.get_perturbation_de(
+    ...     mode="vanilla",         # Point-null hypothesis testing
+    ...     fdr_target=0.05,
+    ...     n_samples=200,
+    ... )
+    
+    # View genes with strong evidence (high Bayes factors)
+    >>> strong_evidence = de_results_vanilla[de_results_vanilla['is_de_bf']]
+    
+    # 2. Enhanced p-value testing (with automatic correction)
+    >>> pval_results = model.get_perturbation_pvalues(
+    ...     correct_multiple_testing=True,  # Now enabled by default!
+    ...     correction_method="fdr_bh",     # Benjamini-Hochberg FDR
+    ...     alpha=0.05,
+    ... )
+    
+    # Access corrected results
+    >>> significant_pvals = pval_results['is_significant']
+    >>> corrected_pvals = pval_results['pvalues_corrected']
+    
+    # 3. Compare different approaches
+    >>> # Bayesian change mode (most principled)
+    >>> bayesian_de = model.get_perturbation_de(mode="change")
+    >>> bayesian_genes = set(bayesian_de[bayesian_de['is_de_fdr']]['gene'])
+    
+    >>> # Enhanced p-values with correction
+    >>> pval_corrected = model.get_perturbation_pvalues(correct_multiple_testing=True)
+    >>> pval_genes = set(pval_corrected['is_significant'].stack().index[
+    ...     pval_corrected['is_significant'].stack()
+    ... ].get_level_values(1))
+    
+    >>> # Compare overlap
+    >>> overlap = bayesian_genes & pval_genes
+    >>> print(f"Overlap: {len(overlap)} genes")
+    
+    # 4. Analyze uncertainty and heterogeneity  
+    >>> uncertainty_results = model.get_perturbation_effects(
+    ...     return_uncertainty=True,
+    ...     uncertainty_metrics=["std", "ci_95", "prob_positive"]
+    ... )
+    
+    >>> heterogeneity = model.analyze_perturbation_heterogeneity()
+    
+    # 5. Manual correction of existing p-values (utility function)
+    >>> raw_pvals = model.get_perturbation_pvalues(correct_multiple_testing=False)
+    >>> corrected = model.correct_pvalues(raw_pvals, method="fdr_bh")
+    
+    Key Advantages of Bayesian Approach
+    -----------------------------------
+    1. **Proper uncertainty quantification**: Uses full posterior distribution
+    2. **Effect size thresholds**: Can test meaningful biological effects (δ > 0.25 log2FC)
+    3. **Bayesian FDR control**: More principled than classical FDR
+    4. **Mixture posterior sampling**: Accounts for latent variable uncertainty (like scVI)
+    5. **Rich output**: Provides probabilities, not just binary decisions
+    
+    Comparison with scVI DE
+    -----------------------
+    ResolVI's get_perturbation_de() implements the same statistical framework as
+    scVI's differential_expression(), but adapted for perturbation analysis:
+    
+    - **scVI**: Compares populations A vs B directly
+    - **ResolVI**: Uses counterfactual inference (control vs perturbed same cells)
+    - **Both**: Bayesian testing with mixture posteriors and proper FDR control
+    
+    Method Selection Guidelines
+    ---------------------------
+    - **get_perturbation_de()**: Most rigorous, recommended for publications
+    - **get_perturbation_pvalues()**: Faster, good for exploration (now with correction!)
+    - **get_perturbation_effects()**: For effect size estimation and uncertainty
+    
+    See Also
+    --------
+    scvi.model.SCVI.differential_expression : scVI's DE testing framework
+    """
+    pass
