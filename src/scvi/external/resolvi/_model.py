@@ -102,13 +102,31 @@ class RESOLVI(
     ... )
     >>> model = scvi.external.RESOLVI(adata)
     
+    >>> # Setup with perturbation + background data (separate keys)
+    >>> scvi.external.RESOLVI.setup_anndata(
+    ...     adata, 
+    ...     perturbation_key="condition", 
+    ...     control_perturbation="Control",
+    ...     background_key="cell_type",
+    ...     background_category="Background"
+    ... )
+    
+    >>> # Setup with perturbation + background data (same key, different categories)
+    >>> scvi.external.RESOLVI.setup_anndata(
+    ...     adata, 
+    ...     perturbation_key="guide_rnas", 
+    ...     control_perturbation="sgCd19",        # Control guide RNA
+    ...     background_key="guide_rnas",          # Same key as perturbation
+    ...     background_category="Other cells"     # Background category
+    ... )
+    
     >>> # Check perturbation distribution
     >>> summary = model.get_perturbation_summary()
     
     >>> # Option 1: Train on all cells (standard)
     >>> model.train()
     
-    >>> # Option 2: Train only on perturbed cells (focuses learning on perturbation effects)
+    >>> # Option 2: Train only on perturbation-relevant cells (control + perturbed, excluding background)
     >>> model.train(train_on_perturbed_only=True)
     
     >>> # Analyze perturbation effects
@@ -130,13 +148,14 @@ class RESOLVI(
     -----
     For perturbation studies, ResolVI can be trained in two modes:
     
-    1. **Standard training**: Uses all cells (control + perturbed) for training. 
+    1. **Standard training**: Uses all cells (control + perturbed + background) for training. 
        This learns a general representation of the cellular state space.
        
-    2. **Perturbation-focused training**: Uses only perturbed cells for training
-       via `train(train_on_perturbed_only=True)`. Background and neighbor computations
-       still use all cells, but the training objective focuses on perturbation effects.
-       This can improve sensitivity for detecting perturbation-specific patterns.
+    2. **Perturbation-focused training**: Uses only perturbation-relevant cells 
+       (both control and perturbed) for training via `train(train_on_perturbed_only=True)`. 
+       Background cells are excluded from training but still used for spatial context.
+       This helps the shift network learn both baseline (control) and perturbation effects
+       while improving sensitivity for detecting perturbation-specific patterns.
 
     See further usage examples in the following tutorials:
 
@@ -345,14 +364,17 @@ class RESOLVI(
         expose_params
             List of parameters to train if running model in Arches mode.
         train_on_perturbed_only
-            If True, trains the model only on perturbed cells (non-control conditions).
-            Background and neighbor computations still use all cells, but the training
-            objective only sees perturbed cells. This is useful for perturbation studies
-            where you want the model to focus on learning perturbation effects.
+            If True, trains the model only on perturbation-relevant cells (both control 
+            and perturbed cells). This excludes background cells that are not part of 
+            the perturbation experiment. Background and neighbor computations still use 
+            all cells, but the training objective focuses on control and perturbed cells.
+            This helps the shift network learn both the baseline (control) and the 
+            perturbation effects. Background cells are used for spatial context but 
+            not for training the perturbation model.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
-        # Handle perturbation-only training
+        # Handle perturbation-focused training
         if train_on_perturbed_only:
             perturbation_idx = self.module.model.perturbation_idx
             if perturbation_idx is None:
@@ -361,7 +383,7 @@ class RESOLVI(
                     "Please call RESOLVI.setup_anndata() with perturbation_key parameter."
                 )
             
-            # Get perturbation categories from the data
+            # Get perturbation and background categories from the data
             from scvi import REGISTRY_KEYS
             if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
                 cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
@@ -373,38 +395,96 @@ class RESOLVI(
                         # Get perturbation values for all cells
                         cell_perturbations = self.adata.obs[perturbation_key].cat.codes.values
                         
-                        # Split cells: perturbed for training, control for validation
-                        perturbed_cell_indices = np.where(cell_perturbations != 0)[0]
-                        control_cell_indices = np.where(cell_perturbations == 0)[0]
+                        # Find background cells if background_key was specified
+                        background_indices = np.array([], dtype=int)
+                        background_key = None
+                        
+                        # Look for background key in the setup args
+                        setup_args_dict = self.adata_manager._get_setup_method_args()
+                        from scvi.data._constants import _SETUP_ARGS_KEY
+                        setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+                        if 'background_key' in setup_args and setup_args['background_key'] is not None:
+                            background_key = setup_args['background_key']
+                            
+                            # Find the background_key index in categorical covariates
+                            background_idx = None
+                            for idx, key in enumerate(field_keys):
+                                if key == background_key:
+                                    background_idx = idx
+                                    break
+                            
+                            if background_idx is not None:
+                                # Get background values for all cells
+                                cell_backgrounds = self.adata.obs[background_key].cat.codes.values
+                                background_indices = np.where(cell_backgrounds == 0)[0]  # First category is background
+                        
+                        # Identify perturbation-relevant cells (control + perturbed, excluding background)
+                        all_indices = np.arange(self.adata.n_obs)
+                        perturbation_relevant_indices = np.setdiff1d(all_indices, background_indices)
+                        
+                        # Split perturbation-relevant cells into control and perturbed
+                        control_cell_indices = np.intersect1d(
+                            perturbation_relevant_indices,
+                            np.where(cell_perturbations == 0)[0]
+                        )
+                        perturbed_cell_indices = np.intersect1d(
+                            perturbation_relevant_indices,
+                            np.where(cell_perturbations != 0)[0]
+                        )
+                        
+                        if len(perturbation_relevant_indices) == 0:
+                            raise ValueError(
+                                "No perturbation-relevant cells found. All cells are background cells. "
+                                "Cannot train on perturbation cells only."
+                            )
                         
                         if len(perturbed_cell_indices) == 0:
                             raise ValueError(
-                                f"No perturbed cells found. All cells have control perturbation "
-                                f"(category 0 in {perturbation_key}). Cannot train on perturbed cells only."
+                                f"No perturbed cells found among non-background cells. "
+                                f"All non-background cells have control perturbation "
+                                f"(category 0 in {perturbation_key}). Cannot train on perturbation experiment."
                             )
                         
                         print(f"Training configuration with train_on_perturbed_only=True:")
-                        print(f"  Training set: {len(perturbed_cell_indices)} perturbed cells "
-                              f"({len(perturbed_cell_indices)/self.adata.n_obs*100:.1f}%)")
-                        print(f"  Validation set: {len(control_cell_indices)} control cells "
+                        print(f"  Training set: {len(perturbation_relevant_indices)} perturbation-relevant cells "
+                              f"({len(perturbation_relevant_indices)/self.adata.n_obs*100:.1f}%)")
+                        print(f"    - Control cells: {len(control_cell_indices)} "
                               f"({len(control_cell_indices)/self.adata.n_obs*100:.1f}%)")
+                        print(f"    - Perturbed cells: {len(perturbed_cell_indices)} "
+                              f"({len(perturbed_cell_indices)/self.adata.n_obs*100:.1f}%)")
+                        if len(background_indices) > 0:
+                            print(f"  Excluded from training: {len(background_indices)} background cells "
+                                  f"({len(background_indices)/self.adata.n_obs*100:.1f}%)")
                         print(f"  Background/neighbor computations: all {self.adata.n_obs} cells")
                         
                         # Use external_indexing to provide custom train/val/test splits
-                        # ALL cells must be assigned to one of the three sets
                         if 'datasplitter_kwargs' not in kwargs:
                             kwargs['datasplitter_kwargs'] = {}
                         
-                        # Provide external indexing: [train_indices, val_indices, test_indices]
-                        # Train: perturbed cells, Val: control cells, Test: empty
-                        kwargs['datasplitter_kwargs']['external_indexing'] = [
-                            perturbed_cell_indices,  # train on perturbed cells only
-                            control_cell_indices,    # validation on control cells
-                            np.array([], dtype=int), # empty test set
-                        ]
-                        
-                        # Since we're using custom validation set, ensure train_size doesn't conflict
-                        # The external_indexing will override train_size anyway
+                        # Train on all perturbation-relevant cells (control + perturbed)
+                        # Use background cells for validation (if any), otherwise split perturbation cells
+                        if len(background_indices) > 0:
+                            # Use background cells for validation
+                            kwargs['datasplitter_kwargs']['external_indexing'] = [
+                                perturbation_relevant_indices,  # train on control + perturbed cells
+                                background_indices,            # validation on background cells
+                                np.array([], dtype=int),       # empty test set
+                            ]
+                        else:
+                            # No background cells, so split perturbation-relevant cells
+                            # Use 80% for training, 20% for validation
+                            np.random.seed(42)  # For reproducibility
+                            shuffled_indices = np.random.permutation(perturbation_relevant_indices)
+                            split_point = int(0.8 * len(shuffled_indices))
+                            
+                            train_indices = shuffled_indices[:split_point]
+                            val_indices = shuffled_indices[split_point:]
+                            
+                            kwargs['datasplitter_kwargs']['external_indexing'] = [
+                                train_indices,               # 80% of perturbation-relevant cells
+                                val_indices,                 # 20% of perturbation-relevant cells  
+                                np.array([], dtype=int),     # empty test set
+                            ]
                         
                     else:
                         raise ValueError(f"Perturbation index {perturbation_idx} out of range for categorical covariates")
@@ -475,7 +555,8 @@ class RESOLVI(
         - percentage: Percentage of total cells
         - is_control: Whether this is the control condition
         - used_for_training: Whether cells with this condition will be used
-          when train_on_perturbed_only=True
+          when train_on_perturbed_only=True (both control and perturbed are used)
+        - is_background: Whether cells are background (excluded from perturbation training)
         """
         perturbation_idx = self.module.model.perturbation_idx
         if perturbation_idx is None:
@@ -498,6 +579,28 @@ class RESOLVI(
                     category_names = perturbation_series.cat.categories.tolist()
                     category_codes = perturbation_series.cat.codes.values
                     
+                    # Check for background cells
+                    background_indices = np.array([], dtype=int)
+                    setup_args_dict = self.adata_manager._get_setup_method_args()
+                    from scvi.data._constants import _SETUP_ARGS_KEY
+                    setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+                    background_key = None
+                    
+                    if 'background_key' in setup_args and setup_args['background_key'] is not None:
+                        background_key = setup_args['background_key']
+                        
+                        # Find the background_key index in categorical covariates
+                        background_idx = None
+                        for idx, key in enumerate(field_keys):
+                            if key == background_key:
+                                background_idx = idx
+                                break
+                        
+                        if background_idx is not None:
+                            # Get background values for all cells
+                            cell_backgrounds = self.adata.obs[background_key].cat.codes.values
+                            background_indices = np.where(cell_backgrounds == 0)[0]  # First category is background
+
                     # Create summary
                     summary_data = []
                     total_cells = len(category_codes)
@@ -506,7 +609,11 @@ class RESOLVI(
                         n_cells = np.sum(category_codes == code)
                         percentage = (n_cells / total_cells) * 100
                         is_control = (code == 0)  # First category is control
-                        used_for_training = not is_control  # All non-control used for training
+                        
+                        # Both control and perturbed cells are used for training in train_on_perturbed_only mode
+                        # Background cells are excluded from training
+                        used_for_training = True  # Both control and perturbed used for training
+                        is_background = False
                         
                         summary_data.append({
                             'perturbation_category': category_name,
@@ -514,21 +621,50 @@ class RESOLVI(
                             'n_cells': n_cells,
                             'percentage': round(percentage, 2),
                             'is_control': is_control,
-                            'used_for_training': used_for_training
+                            'used_for_training': used_for_training,
+                            'is_background': is_background
                         })
+                    
+                    # Add background information if available
+                    if len(background_indices) > 0 and background_key:
+                        background_categories = self.adata.obs[background_key].cat.categories.tolist()
+                        background_codes = self.adata.obs[background_key].cat.codes.values
+                        
+                        for code, category_name in enumerate(background_categories):
+                            n_cells = np.sum(background_codes == code)
+                            if n_cells > 0:
+                                percentage = (n_cells / total_cells) * 100
+                                is_background = (code == 0)  # First category is background
+                                
+                                summary_data.append({
+                                    'perturbation_category': f"[Background] {category_name}",
+                                    'perturbation_code': f"bg_{code}",
+                                    'n_cells': n_cells,
+                                    'percentage': round(percentage, 2),
+                                    'is_control': False,
+                                    'used_for_training': not is_background,  # Background cells excluded
+                                    'is_background': is_background
+                                })
                     
                     df = pd.DataFrame(summary_data)
                     
                     # Add summary statistics
-                    n_control = df[df['is_control']]['n_cells'].sum()
-                    n_perturbed = df[~df['is_control']]['n_cells'].sum()
+                    n_control = df[(df['is_control']) & (~df['is_background'])]['n_cells'].sum()
+                    n_perturbed = df[(~df['is_control']) & (~df['is_background'])]['n_cells'].sum()
+                    n_background = df[df['is_background']]['n_cells'].sum()
+                    n_perturbation_relevant = n_control + n_perturbed
                     
                     print(f"Perturbation Summary for key '{perturbation_key}':")
                     print(f"  Total cells: {total_cells}")
                     print(f"  Control cells: {n_control} ({n_control/total_cells*100:.1f}%)")
                     print(f"  Perturbed cells: {n_perturbed} ({n_perturbed/total_cells*100:.1f}%)")
+                    if n_background > 0:
+                        print(f"  Background cells: {n_background} ({n_background/total_cells*100:.1f}%)")
                     print(f"\nWhen train_on_perturbed_only=True:")
-                    print(f"  - Training will use {n_perturbed} perturbed cells")
+                    print(f"  - Training will use {n_perturbation_relevant} perturbation-relevant cells")
+                    print(f"    (both {n_control} control + {n_perturbed} perturbed cells)")
+                    if n_background > 0:
+                        print(f"  - {n_background} background cells will be excluded from training")
                     print(f"  - Background/neighbor computations will still use all {total_cells} cells")
                     
                     return df
@@ -550,6 +686,8 @@ class RESOLVI(
         categorical_covariate_keys: list[str] | None = None,
         perturbation_key: str | None = None,
         control_perturbation: str | None = None,
+        background_key: str | None = None,
+        background_category: str | None = None,
         prepare_data: bool | None = True,
         prepare_data_kwargs: dict = None,
         unlabeled_category: str = "unknown",
@@ -569,6 +707,17 @@ class RESOLVI(
         control_perturbation
             Value in perturbation_key column that represents the control condition.
             If None, the first category alphabetically will be used as control.
+        background_key
+            Key in adata.obs for background cell categories. Background cells are those
+            that should not be used for perturbation training (neither control nor perturbed).
+            When train_on_perturbed_only=True, only control and perturbed cells will be used
+            for training, while background cells will be excluded from training but still
+            used for neighbor and background computations. Can be the same as perturbation_key
+            if different categories within the same column represent different cell roles.
+        background_category
+            Value in background_key column that represents background cells.
+            If None and background_key is provided, the first category will be used.
+            Should be different from control_perturbation if using the same key.
         prepare_data
             If True, prepares AnnData for training. Computes spatial neighbors and distances.
         prepare_data_kwargs
@@ -605,6 +754,23 @@ class RESOLVI(
                 prepare_data_kwargs = {}
             RESOLVI._prepare_data(adata, batch_key=batch_key, **prepare_data_kwargs)
 
+        # Initialize categorical_covariate_keys as a set to avoid duplicates
+        if categorical_covariate_keys is None:
+            categorical_covariate_keys = []
+        else:
+            categorical_covariate_keys = list(categorical_covariate_keys)
+        
+        # Validate usage when same key is used for perturbation and background
+        if (perturbation_key is not None and background_key is not None and 
+            perturbation_key == background_key):
+            if (control_perturbation is not None and background_category is not None and 
+                control_perturbation == background_category):
+                raise ValueError(
+                    f"When using the same key ('{perturbation_key}') for both perturbation_key and "
+                    f"background_key, control_perturbation ('{control_perturbation}') and "
+                    f"background_category ('{background_category}') must be different values."
+                )
+
         # Handle control perturbation mapping and include in categorical covariates
         if perturbation_key is not None:
             if control_perturbation is not None:
@@ -619,11 +785,30 @@ class RESOLVI(
                     new_categories = [control_perturbation] + current_categories
                     adata.obs[perturbation_key] = adata.obs[perturbation_key].cat.reorder_categories(new_categories)
             
-            # Include perturbation in categorical covariates
-            if categorical_covariate_keys is None:
-                categorical_covariate_keys = [perturbation_key]
-            else:
-                categorical_covariate_keys = list(categorical_covariate_keys) + [perturbation_key]
+            # Include perturbation in categorical covariates (avoid duplicates)
+            if perturbation_key not in categorical_covariate_keys:
+                categorical_covariate_keys.append(perturbation_key)
+
+        # Handle background key if provided
+        if background_key is not None:
+            if background_category is not None:
+                if background_category not in adata.obs[background_key].unique():
+                    raise ValueError(f"Background category '{background_category}' not found in {background_key}")
+                
+                # Reorder categories to put background first
+                current_categories = adata.obs[background_key].cat.categories.tolist()
+                if background_category in current_categories:
+                    current_categories.remove(background_category)
+                    new_categories = [background_category] + current_categories
+                    adata.obs[background_key] = adata.obs[background_key].cat.reorder_categories(new_categories)
+            
+            # Include background in categorical covariates (avoid duplicates)
+            if background_key not in categorical_covariate_keys:
+                categorical_covariate_keys.append(background_key)
+        
+        # Convert back to None if empty to maintain compatibility
+        if len(categorical_covariate_keys) == 0:
+            categorical_covariate_keys = None
 
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
