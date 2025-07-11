@@ -366,6 +366,9 @@ class ResolVIPredictiveMixin:
                 px_scale, _, px_rate, _ = self.module.model.decoder(
                     self.module.model.dispersion, z, kwargs["library"], batch, *categorical_input
                 )
+                
+                # No perturbation shifts applied - this returns baseline control expression
+                
                 if library_size is not None:
                     exp_ = library_size * px_scale
                 else:
@@ -628,10 +631,9 @@ class ResolVIPredictiveMixin:
         z_fixed = torch.from_numpy(z_fixed).to(device)
         
         # Check perturbation setup
-        perturbation_idx = self.module.model.perturbation_idx
-        if perturbation_idx is None:
+        if "perturbation" not in self.adata_manager.data_registry:
             raise ValueError(
-                "No perturbation found in categorical covariates. "
+                "No perturbation found in data registry. "
                 "To enable perturbation analysis, you need to:\n"
                 "1. Call RESOLVI.setup_anndata() with perturbation_key parameter\n"
                 "2. Specify which column in adata.obs contains perturbation categories\n"
@@ -645,7 +647,16 @@ class ResolVIPredictiveMixin:
                 "model = RESOLVI(adata)"
             )
             
-        n_perturbs = self.module.model.n_perturbs
+        # Get perturbation info from setup args
+        setup_args_dict = self.adata_manager._get_setup_method_args()
+        from scvi.data._constants import _SETUP_ARGS_KEY
+        setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+        perturbation_key = setup_args.get('perturbation_key')
+        
+        if not perturbation_key:
+            raise ValueError("Could not find perturbation_key in setup args")
+        
+        n_perturbs = len(self.adata.obs[perturbation_key].cat.categories)
         if perturbation_list is None:
             if n_perturbs <= 1:
                 raise ValueError(f"Model has {n_perturbs} perturbations, need at least 2 (including control)")
@@ -664,27 +675,19 @@ class ResolVIPredictiveMixin:
             return_numpy = True
 
         # Check what the actual perturbation categories are in the data
-        if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
-            cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
-            if hasattr(cat_state_registry, 'field_keys'):
-                field_keys = cat_state_registry.field_keys
-                if perturbation_idx < len(field_keys):
-                    perturbation_key = field_keys[perturbation_idx]
-                    
-                    # Get the actual perturbation values from the original data
-                    original_perturb_values = adata.obs[perturbation_key].cat.categories.tolist()
-                    
-                    # Map category names to indices
-                    perturb_name_to_idx = {name: idx for idx, name in enumerate(original_perturb_values)}
-                    
-                    # The control should be index 0 (first category)
-                    control_name = original_perturb_values[0]
-                    
-                    # Update perturbation_list to use actual meaningful perturbations
-                    if perturbation_list == list(range(1, n_perturbs)):
-                        # Default case - use all non-control perturbations
-                        perturbation_list = list(range(1, len(original_perturb_values)))
-                        treatment_names = [original_perturb_values[i] for i in perturbation_list]
+        original_perturb_values = adata.obs.iloc[indices][perturbation_key].cat.categories.tolist()
+        
+        # Map category names to indices
+        perturb_name_to_idx = {name: idx for idx, name in enumerate(original_perturb_values)}
+        
+        # The control should be index 0 (first category)
+        control_name = original_perturb_values[0]
+        
+        # Update perturbation_list to use actual meaningful perturbations
+        if perturbation_list == list(range(1, n_perturbs)):
+            # Default case - use all non-control perturbations
+            perturbation_list = list(range(1, len(original_perturb_values)))
+            treatment_names = [original_perturb_values[i] for i in perturbation_list]
         
         # Create data loader for getting other necessary tensors
         scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
@@ -716,9 +719,8 @@ class ResolVIPredictiveMixin:
             
             # If all cells are from the same perturbation condition,
             # we should use THAT as our baseline, not force it to 0
-            if kwargs["cat_covs"] is not None:
-                original_perturbs = kwargs["cat_covs"][:, perturbation_idx]
-                actual_baseline_perturb = original_perturbs[0].item()  # All cells should have same perturbation
+            if kwargs["perturbation_data"] is not None:
+                actual_baseline_perturb = kwargs["perturbation_data"][0].item()  # All cells should have same perturbation
             else:
                 actual_baseline_perturb = 0
             
@@ -744,21 +746,14 @@ class ResolVIPredictiveMixin:
                 perturb_progress = enumerate(all_perturb_vals)
             
             for perturb_idx_local, perturb_val in perturb_progress:
-                # Create modified cat_covs with this specific perturbation
-                if kwargs["cat_covs"] is not None:
-                    cat_covs_modified = kwargs["cat_covs"].clone()
-                    cat_covs_modified[:, perturbation_idx] = perturb_val
-                else:
-                    # Create cat_covs if it doesn't exist
-                    cat_covs_modified = torch.zeros(
-                        (batch_size_actual, perturbation_idx + 1), 
-                        device=device, dtype=torch.long
-                    )
-                    cat_covs_modified[:, perturbation_idx] = perturb_val
+                # Create modified perturbation data with this specific perturbation
+                perturbation_data_modified = torch.full_like(
+                    kwargs["perturbation_data"], perturb_val, device=device, dtype=torch.long
+                )
                 
                 # Create model kwargs with modified perturbations
                 model_kwargs = kwargs.copy()
-                model_kwargs["cat_covs"] = cat_covs_modified
+                model_kwargs["perturbation_data"] = perturbation_data_modified
                 
                 # Create a model that uses the perturbation shift network
                 def single_perturbation_model():
@@ -1237,9 +1232,8 @@ class ResolVIPredictiveMixin:
         z_fixed = torch.from_numpy(z_fixed).to(device)
         
         # Check perturbation setup
-        perturbation_idx = self.module.model.perturbation_idx
-        if perturbation_idx is None:
-            raise ValueError("No perturbation found in categorical covariates.")
+        if "perturbation" not in self.adata_manager.data_registry:
+            raise ValueError("No perturbation found in data registry.")
             
         n_perturbs = self.module.model.n_perturbs
         if perturbation_list is None:
@@ -1262,8 +1256,8 @@ class ResolVIPredictiveMixin:
             batch_size_actual = kwargs["x"].shape[0]
             z_batch = z_fixed[:batch_size_actual, :]
             
-            if kwargs["cat_covs"] is not None:
-                original_perturbs = kwargs["cat_covs"][:, perturbation_idx]
+            if kwargs["perturbation_data"] is not None:
+                original_perturbs = kwargs["perturbation_data"]
                 actual_baseline_perturb = original_perturbs[0].item()
             else:
                 actual_baseline_perturb = 0
@@ -1276,18 +1270,13 @@ class ResolVIPredictiveMixin:
             all_perturb_vals = [baseline_perturb] + [p for p in perturbation_list if p != baseline_perturb]
             
             for perturb_val in all_perturb_vals:
-                if kwargs["cat_covs"] is not None:
-                    cat_covs_modified = kwargs["cat_covs"].clone()
-                    cat_covs_modified[:, perturbation_idx] = perturb_val
-                else:
-                    cat_covs_modified = torch.zeros(
-                        (batch_size_actual, perturbation_idx + 1), 
-                        device=device, dtype=torch.long
-                    )
-                    cat_covs_modified[:, perturbation_idx] = perturb_val
+                # Create modified perturbation data with this specific perturbation
+                perturbation_data_modified = torch.full_like(
+                    kwargs["perturbation_data"], perturb_val, device=device, dtype=torch.long
+                )
                 
                 model_kwargs = kwargs.copy()
-                model_kwargs["cat_covs"] = cat_covs_modified
+                model_kwargs["perturbation_data"] = perturbation_data_modified
                 
                 def single_perturbation_model():
                     with pyro.condition(data={"latent": z_batch}):
@@ -1477,10 +1466,9 @@ class ResolVIPredictiveMixin:
             indices = np.arange(adata.n_obs)
             
         # Check perturbation setup
-        perturbation_idx = self.module.model.perturbation_idx
-        if perturbation_idx is None:
+        if "perturbation" not in self.adata_manager.data_registry:
             raise ValueError(
-                "No perturbation found in categorical covariates. "
+                "No perturbation found in data registry. "
                 "To enable perturbation analysis, you need to:\n"
                 "1. Call RESOLVI.setup_anndata() with perturbation_key parameter\n"
                 "2. Specify which column in adata.obs contains perturbation categories\n"
@@ -1698,7 +1686,6 @@ class ResolVIPredictiveMixin:
             self.module = self.module.to(device)
             
         gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
-        perturbation_idx = self.module.model.perturbation_idx
         
         # Get variational posteriors for all cells 
         qz_means, qz_vars = self.get_latent_representation(
@@ -1709,24 +1696,26 @@ class ResolVIPredictiveMixin:
         
         # Identify which cells belong to which perturbation condition
         control_indices = np.arange(len(indices))  # Default: use all cells
-        if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
-            cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
-            if hasattr(cat_state_registry, 'field_keys'):
-                field_keys = cat_state_registry.field_keys
-                if perturbation_idx < len(field_keys):
-                    perturbation_key = field_keys[perturbation_idx]
-                    cell_perturbations = adata.obs.iloc[indices][perturbation_key].values
-                    
-                    # Find control condition (should be index 0)
-                    control_mask = cell_perturbations == 0
-                    control_indices = np.where(control_mask)[0]
-                    
-                    if len(control_indices) == 0:
-                        # If no explicit control cells, use the most common condition as baseline
-                        unique_vals, counts = np.unique(cell_perturbations, return_counts=True)
-                        control_val = unique_vals[np.argmax(counts)]
-                        control_mask = cell_perturbations == control_val
-                        control_indices = np.where(control_mask)[0]
+        
+        # Get perturbation info from setup args
+        setup_args_dict = self.adata_manager._get_setup_method_args()
+        from scvi.data._constants import _SETUP_ARGS_KEY
+        setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+        perturbation_key = setup_args.get('perturbation_key')
+        
+        if perturbation_key and perturbation_key in adata.obs.columns:
+            cell_perturbations = adata.obs.iloc[indices][perturbation_key].cat.codes.values
+            
+            # Find control condition (should be index 0)
+            control_mask = cell_perturbations == 0
+            control_indices = np.where(control_mask)[0]
+            
+            if len(control_indices) == 0:
+                # If no explicit control cells, use the most common condition as baseline
+                unique_vals, counts = np.unique(cell_perturbations, return_counts=True)
+                control_val = unique_vals[np.argmax(counts)]
+                control_mask = cell_perturbations == control_val
+                control_indices = np.where(control_mask)[0]
         
         # Create data loader for getting model tensors
         scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
@@ -1787,14 +1776,9 @@ class ResolVIPredictiveMixin:
                     
                     # Generate counterfactual expressions for control condition
                     control_kwargs = kwargs.copy()
-                    if control_kwargs["cat_covs"] is not None:
-                        control_kwargs["cat_covs"] = control_kwargs["cat_covs"].clone()
-                        control_kwargs["cat_covs"][:, perturbation_idx] = 0  # Control condition
-                    else:
-                        control_kwargs["cat_covs"] = torch.zeros(
-                            (batch_size_actual, perturbation_idx + 1), 
-                            device=device, dtype=torch.long
-                        )
+                    control_kwargs["perturbation_data"] = torch.zeros_like(
+                        kwargs["perturbation_data"], device=device, dtype=torch.long
+                    )  # Control condition
                     
                     def control_model():
                         with pyro.condition(data={"latent": control_latents}):
@@ -1809,15 +1793,9 @@ class ResolVIPredictiveMixin:
                     
                     # Generate counterfactual expressions for perturbation condition  
                     perturb_kwargs = kwargs.copy()
-                    if perturb_kwargs["cat_covs"] is not None:
-                        perturb_kwargs["cat_covs"] = perturb_kwargs["cat_covs"].clone()
-                        perturb_kwargs["cat_covs"][:, perturbation_idx] = perturb_val
-                    else:
-                        perturb_kwargs["cat_covs"] = torch.zeros(
-                            (batch_size_actual, perturbation_idx + 1), 
-                            device=device, dtype=torch.long
-                        )
-                        perturb_kwargs["cat_covs"][:, perturbation_idx] = perturb_val
+                    perturb_kwargs["perturbation_data"] = torch.full_like(
+                        kwargs["perturbation_data"], perturb_val, device=device, dtype=torch.long
+                    )
                     
                     def perturb_model():
                         with pyro.condition(data={"latent": perturb_latents}):
@@ -1964,9 +1942,10 @@ class ResolVIPredictiveMixin:
                 kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
 
                 # Force perturbations to control (zero indices) for control assumption
-                if kwargs["cat_covs"] is not None and self.module.model.perturbation_idx is not None:
-                    kwargs["cat_covs"] = kwargs["cat_covs"].clone()
-                    kwargs["cat_covs"][:, self.module.model.perturbation_idx] = 0
+                if kwargs["perturbation_data"] is not None:
+                    kwargs["perturbation_data"] = torch.zeros_like(
+                        kwargs["perturbation_data"], device=device, dtype=torch.long
+                    )
 
                 if kwargs["cat_covs"] is not None and self.module.encode_covariates:
                     categorical_input = list(torch.split(kwargs["cat_covs"], 1, dim=1))
@@ -1996,25 +1975,8 @@ class ResolVIPredictiveMixin:
                     self.module.model.dispersion, z, kwargs["library"], batch, *categorical_input
                 )
                 
-                # Apply perturbation shifts (which will be zero for control conditions)
-                if self.module.model.perturbation_idx is not None and kwargs["cat_covs"] is not None:
-                    perturb_idx = kwargs["cat_covs"][:, self.module.model.perturbation_idx].long()
-                    u_k = self.module.model.perturb_emb(perturb_idx)
-                    
-                    if z.ndim == 3 and u_k.ndim == 2:
-                        u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
-                    
-                    delta = self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
-                    
-                    # Mask will be all zeros since we set perturbation indices to 0
-                    mask = (perturb_idx != 0).float().unsqueeze(-1)
-                    if z.ndim == 3:
-                        mask = mask.unsqueeze(0)
-                    
-                    log_px_rate_base = torch.log(px_rate + 1e-8)
-                    log_px_rate = log_px_rate_base + mask * delta
-                    px_rate = torch.exp(log_px_rate)
-
+                # No perturbation shifts applied - this returns baseline control expression
+                
                 if library_size is not None:
                     exp_ = library_size * px_scale
                 else:
@@ -2163,14 +2125,14 @@ class ResolVIPredictiveMixin:
                 )
                 
                 # Apply actual perturbation shifts based on real perturbation indices
-                if self.module.model.perturbation_idx is not None and kwargs["cat_covs"] is not None:
-                    perturb_idx = kwargs["cat_covs"][:, self.module.model.perturbation_idx].long()
+                if kwargs["perturbation_data"] is not None:
+                    perturb_idx = kwargs["perturbation_data"].long()
                     u_k = self.module.model.perturb_emb(perturb_idx)
                     
                     if z.ndim == 3 and u_k.ndim == 2:
                         u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
                     
-                    delta = self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
+                    delta = self.module.model.shift_scale * self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
                     
                     # Use actual perturbation mask (will be non-zero for perturbed cells)
                     mask = (perturb_idx != 0).float().unsqueeze(-1)
@@ -2203,6 +2165,132 @@ class ResolVIPredictiveMixin:
             )
         else:
             return exprs
+
+    @torch.inference_mode()
+    def get_shift_network_outputs(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        batch_size: int | None = None,
+        return_numpy: bool | None = None,
+        silent: bool = True,
+    ) -> np.ndarray | pd.DataFrame:
+        """
+        Get raw shift network outputs (deltas) before masking or sampling.
+        
+        This method extracts the direct predictions from the shift network for each cell
+        and perturbation, providing insight into what shifts the model has learned
+        for different perturbations.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
+            AnnData object used to initialize the model.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        batch_size
+            Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+        return_numpy
+            Return a :class:`~numpy.ndarray` instead of a :class:`~pandas.DataFrame`. DataFrame
+            includes gene names as columns and cell indices as rows. If `None`, defaults to `False`.
+        silent
+            Whether to disable progress bar.
+
+        Returns
+        -------
+        Raw shift network outputs with shape (n_cells, n_genes).
+        Values represent log-space shifts that would be applied to base expression.
+        """
+        adata = self._validate_anndata(adata)
+
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        _, _, device = parse_device_args(
+            accelerator="auto",
+            devices="auto",
+            return_device="torch",
+            validate_single_device=True,
+        )
+
+        shift_outputs = []
+        perturbation_indices = []
+
+        for tensors in scdl:
+            _, kwargs = self.module._get_fn_args_from_batch(tensors)
+            kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
+
+            # Get latent representations
+            if kwargs["cat_covs"] is not None and self.module.encode_covariates:
+                categorical_input = list(torch.split(kwargs["cat_covs"], 1, dim=1))
+            else:
+                categorical_input = ()
+
+            # Add numerical stability
+            x_log = _safe_log_norm(kwargs["x"])
+            
+            qz_m, qz_v, _ = self.module.z_encoder(
+                x_log,
+                kwargs["batch_index"],
+                *categorical_input,
+            )
+            # Use mean of latent distribution for consistency
+            z = qz_m
+
+            # Get perturbation data and embeddings
+            if kwargs["perturbation_data"] is not None:
+                perturb_idx = kwargs["perturbation_data"].long()
+                u_k = self.module.model.perturb_emb(perturb_idx)
+                
+                # Get raw shift network outputs (before scaling)
+                raw_delta = self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
+                # Apply scaling to match what's used in the model
+                scaled_delta = self.module.model.shift_scale * raw_delta
+                
+                shift_outputs.append(scaled_delta.cpu().numpy())
+                perturbation_indices.append(perturb_idx.cpu().numpy())
+            else:
+                # No perturbation data - create zero shifts
+                zero_shifts = torch.zeros(z.shape[0], self.module.model.n_input, device=device)
+                shift_outputs.append(zero_shifts.cpu().numpy())
+                perturbation_indices.append(np.zeros(z.shape[0], dtype=int))
+
+        # Concatenate all batches
+        all_shifts = np.concatenate(shift_outputs, axis=0)
+        all_perturb_idx = np.concatenate(perturbation_indices, axis=0)
+
+        if return_numpy is None:
+            return_numpy = False
+
+        if return_numpy:
+            return all_shifts
+        else:
+            # Create DataFrame with gene names and additional info
+            df = pd.DataFrame(
+                all_shifts,
+                columns=adata.var_names,
+                index=adata.obs_names[indices],
+            )
+            # Add perturbation information as metadata
+            df.attrs['perturbation_indices'] = all_perturb_idx
+            
+            # Add perturbation labels if available
+            try:
+                # Try to get perturbation key from setup
+                setup_args_dict = self.adata_manager._get_setup_method_args()
+                from scvi.data._constants import _SETUP_ARGS_KEY
+                setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+                perturbation_key = setup_args.get('perturbation_key')
+                
+                if perturbation_key and perturbation_key in adata.obs.columns:
+                    perturb_labels = adata.obs.iloc[indices][perturbation_key].values
+                    df.attrs['perturbation_labels'] = perturb_labels
+            except:
+                pass
+                
+            return df
 
 def bayesian_perturbation_analysis_example():
     """
