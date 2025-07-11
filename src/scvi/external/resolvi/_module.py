@@ -135,6 +135,20 @@ class RESOLVAEModel(PyroModule):
         Kernel size in the RBF kernel to estimate distances between cells and neighbors.
     encode_covariates:
         Whether to concatenate covariates to expression in encoder
+    override_mixture_k_in_semisupervised:
+        If True (default), automatically sets mixture_k to the number of cell type labels
+        when semisupervised=True. If False, respects the user-provided mixture_k value
+        even in semisupervised mode. When mixture_k < n_labels in semisupervised mode,
+        label information is mapped to available mixture components:
+        - If mixture_k=1: all cells use the same mixture component
+        - If mixture_k>1: labels are mapped modulo mixture_k to available components
+    
+    Notes
+    -----
+    When using custom mixture_k in semisupervised mode (override_mixture_k_in_semisupervised=False),
+    the model will adapt the label conditioning to work with the available mixture components.
+    This is useful for perturbation studies where perturbed cells are homogeneous (same cell type)
+    and you want to use mixture_k=1 for computational efficiency.
     """
 
     def __init__(
@@ -169,10 +183,12 @@ class RESOLVAEModel(PyroModule):
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
         perturbation_idx: int | None = None,
+        override_mixture_k_in_semisupervised: bool = True,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
         self.expression_anntorchdata = expression_anntorchdata
+        self.override_mixture_k_in_semisupervised = override_mixture_k_in_semisupervised
         self.register_buffer("gene_dummy", torch.ones([n_batch, n_input]))
 
         self.dispersion = dispersion
@@ -212,7 +228,7 @@ class RESOLVAEModel(PyroModule):
         self.register_buffer("sparsity_diffusion", torch.tensor(sparsity_diffusion))
         self.register_buffer("gene_dummy", torch.ones([n_batch, n_input]))
 
-        if self.semisupervised:
+        if self.semisupervised and override_mixture_k_in_semisupervised:
             mixture_k = n_labels
 
         self.register_buffer("u_prior_logits", torch.ones([mixture_k]))
@@ -435,19 +451,36 @@ class RESOLVAEModel(PyroModule):
             )
 
             if self.semisupervised:
-                logits_input = (
-                    torch.stack(
-                        [
-                            torch.nn.functional.one_hot(y_i, self.n_labels)
-                            if y_i < self.n_labels
-                            else torch.zeros(self.n_labels).to(x.device)
-                            for y_i in y
-                        ]
+                # Get the actual mixture_k from the registered buffers
+                current_mixture_k = u_prior_logits.shape[0]
+                
+                if current_mixture_k == self.n_labels:
+                    # Standard case: mixture_k equals n_labels
+                    logits_input = (
+                        torch.stack(
+                            [
+                                torch.nn.functional.one_hot(y_i, self.n_labels)
+                                if y_i < self.n_labels
+                                else torch.zeros(self.n_labels).to(x.device)
+                                for y_i in y
+                            ]
+                        )
+                        .to(x.device)
+                        .float()
                     )
-                    .to(x.device)
-                    .float()
-                )
-                u_prior_logits = u_prior_logits + 10 * logits_input
+                    u_prior_logits = u_prior_logits + 10 * logits_input
+                else:
+                    # Custom mixture_k case: map labels to available mixture components
+                    if current_mixture_k == 1:
+                        # Single mixture component: all cells get same treatment
+                        logits_input = torch.ones(x.shape[0], 1, device=x.device)
+                    else:
+                        # Multiple mixture components: map labels modulo mixture_k
+                        mapped_labels = torch.clamp(y % current_mixture_k, 0, current_mixture_k - 1)
+                        logits_input = torch.nn.functional.one_hot(mapped_labels, current_mixture_k).float()
+                    
+                    u_prior_logits = u_prior_logits + 10 * logits_input
+                
                 u_prior_means = u_prior_means.expand(x.shape[0], -1, -1)
                 u_prior_scales = u_prior_scales.expand(x.shape[0], -1, -1)
             cats = Categorical(logits=u_prior_logits)
@@ -1143,6 +1176,7 @@ class RESOLVAE(PyroBaseModuleClass):
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
         perturbation_idx: int | None = None,
+        override_mixture_k_in_semisupervised: bool = True,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1231,6 +1265,7 @@ class RESOLVAE(PyroBaseModuleClass):
             perturbation_embed_dim=perturbation_embed_dim,
             perturbation_hidden_dim=perturbation_hidden_dim,
             perturbation_idx=perturbation_idx,
+            override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 

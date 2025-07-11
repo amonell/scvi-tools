@@ -1980,3 +1980,110 @@ def bayesian_perturbation_analysis_example():
     scvi.model.SCVI.differential_expression : scVI's DE testing framework
     """
     pass
+
+def perturbation_focused_training_example():
+    """
+    Example of using ResolVI's perturbation-focused training mode.
+    
+    This demonstrates the new train_on_perturbed_only functionality which trains
+    the model only on perturbed cells while keeping background and neighbor
+    computations from all cells.
+    
+    Examples
+    --------
+    # Setup ResolVI with perturbation data
+    >>> import scanpy as sc
+    >>> from scvi.external import RESOLVI
+    
+    >>> # Load your spatial + perturbation data
+    >>> adata = sc.read_h5ad("your_perturbation_data.h5ad")
+    
+    >>> # Setup with perturbation information
+    >>> RESOLVI.setup_anndata(
+    ...     adata,
+    ...     spatial_rep="X_spatial",        # Spatial coordinates
+    ...     perturbation_key="condition",    # Column with perturbation info
+    ...     control_perturbation="Control",  # Name of control condition
+    ...     batch_key="batch",              # Optional batch info
+    ... )
+    
+    >>> # Create model
+    >>> model = RESOLVI(adata)
+    
+    >>> # Check perturbation distribution before training
+    >>> summary = model.get_perturbation_summary()
+    >>> print(summary)
+    #     perturbation_category  perturbation_code  n_cells  percentage  is_control  used_for_training
+    # 0               Control                  0     5000        50.0        True              False
+    # 1             Treatment1                  1     2500        25.0       False               True
+    # 2             Treatment2                  2     1500        15.0       False               True
+    # 3             Treatment3                  3     1000        10.0       False               True
+    
+    >>> # Training Option 1: Standard training (all cells)
+    >>> model_standard = RESOLVI(adata)
+    >>> model_standard.train(max_epochs=50)
+    >>> print("Standard training: learned from all 10,000 cells")
+    
+    >>> # Training Option 2: Perturbation-focused training (perturbed cells only)
+    >>> model_focused = RESOLVI(adata)
+    >>> model_focused.train(
+    ...     max_epochs=50,
+    ...     train_on_perturbed_only=True,  # KEY: Only train on perturbed cells
+    ...     lr=1e-3,                       # May need different learning rate
+    ... )
+    >>> print("Focused training: learned from 5,000 perturbed cells")
+    >>> print("Background/neighbors still computed from all 10,000 cells")
+    
+    >>> # Compare perturbation effects between training modes
+    >>> effects_standard = model_standard.get_perturbation_effects()
+    >>> effects_focused = model_focused.get_perturbation_effects()
+    
+    >>> # The focused model often shows:
+    >>> # - More sensitive detection of perturbation effects
+    >>> # - Better separation of perturbation-specific patterns
+    >>> # - Reduced influence of control cell variability
+    
+    >>> # Analyze with Bayesian testing
+    >>> de_standard = model_standard.get_perturbation_de(mode="change")
+    >>> de_focused = model_focused.get_perturbation_de(mode="change")
+    
+    >>> # Compare number of significant genes
+    >>> n_sig_standard = de_standard['is_de_fdr'].sum()
+    >>> n_sig_focused = de_focused['is_de_fdr'].sum()
+    >>> print(f"Standard training: {n_sig_standard} significant genes")
+    >>> print(f"Focused training: {n_sig_focused} significant genes")
+    
+    When to Use Perturbation-Focused Training
+    ------------------------------------------
+    **Use train_on_perturbed_only=True when:**
+    - You want maximum sensitivity for detecting perturbation effects
+    - Control cells are very heterogeneous and might dilute perturbation signals
+    - You have many control cells but fewer perturbed cells
+    - Your perturbations create strong, specific effects you want to capture
+    
+    **Use standard training when:**
+    - You want a general model of the cellular state space
+    - Control and perturbed cells are well-balanced
+    - You need the model to understand the full range of cellular variation
+    - You're doing exploratory analysis before focusing on perturbations
+    
+    Technical Details
+    -----------------
+    When train_on_perturbed_only=True:
+    
+    1. **Training data**: Only perturbed cells (condition != control)
+    2. **Spatial neighbors**: Computed from ALL cells (maintains spatial context)
+    3. **Background estimation**: Computed from ALL cells (proper background model)
+    4. **Model parameters**: Same architecture, different training data
+    5. **Inference**: Works on any cell (control or perturbed)
+    
+    This approach maintains the spatial and background modeling benefits while
+    focusing the learning objective on perturbation-specific patterns.
+    
+    See Also
+    --------
+    RESOLVI.get_perturbation_summary : Check perturbation distribution
+    RESOLVI.get_perturbation_effects : Estimate perturbation effects
+    RESOLVI.get_perturbation_de : Bayesian differential expression testing
+    """
+    pass

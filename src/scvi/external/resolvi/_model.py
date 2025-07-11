@@ -45,6 +45,9 @@ class RESOLVI(
     """
     ResolVI addresses noise and bias in single-cell resolved spatial transcriptomics data.
 
+    This model also supports perturbation analysis through counterfactual inference,
+    allowing estimation of gene expression changes due to genetic or chemical perturbations.
+
     Parameters
     ----------
     adata
@@ -70,20 +73,71 @@ class RESOLVI(
         * ``'nb'`` - Negative binomial distribution
         * ``'zinb'`` - Zero-inflated negative binomial distribution
         * ``'poisson'`` - Poisson distribution
+    override_mixture_k_in_semisupervised
+        If True (default), automatically sets mixture_k to the number of cell type labels
+        when semisupervised=True. If False, respects the user-provided mixture_k value
+        even in semisupervised mode. This is useful when you have homogeneous cell types
+        in your perturbation data and want to set mixture_k=1.
     **model_kwargs
         Keyword args for :class:`~scvi.module.VAE`
 
     Examples
     --------
+    Basic spatial analysis:
+    
     >>> adata = anndata.read_h5ad(path_to_anndata)
-    >>> scvi.model.SCVI.setup_anndata(adata, batch_key="batch")
-    >>> vae = scvi.model.SCVI(adata)
-    >>> vae.train()
-    >>> adata.obsm["X_scVI"] = vae.get_latent_representation()
-    >>> adata.obsm["X_normalized_scVI"] = vae.get_normalized_expression()
+    >>> scvi.external.RESOLVI.setup_anndata(adata, batch_key="batch")
+    >>> model = scvi.external.RESOLVI(adata)
+    >>> model.train()
+    >>> adata.obsm["X_ResolVI"] = model.get_latent_representation()
+    >>> adata.obsm["X_normalized_ResolVI"] = model.get_normalized_expression()
+    
+    Perturbation analysis:
+    
+    >>> # Setup with perturbation data
+    >>> scvi.external.RESOLVI.setup_anndata(
+    ...     adata, 
+    ...     perturbation_key="condition",
+    ...     control_perturbation="Control"
+    ... )
+    >>> model = scvi.external.RESOLVI(adata)
+    
+    >>> # Check perturbation distribution
+    >>> summary = model.get_perturbation_summary()
+    
+    >>> # Option 1: Train on all cells (standard)
+    >>> model.train()
+    
+    >>> # Option 2: Train only on perturbed cells (focuses learning on perturbation effects)
+    >>> model.train(train_on_perturbed_only=True)
+    
+    >>> # Analyze perturbation effects
+    >>> effects = model.get_perturbation_effects()
+    >>> de_results = model.get_perturbation_de(mode="change")
+    
+    Using custom mixture_k in semisupervised mode:
+    
+    >>> # When your perturbed cells are homogeneous (same cell type)
+    >>> # and you want to override the automatic mixture_k setting
+    >>> model = scvi.external.RESOLVI(
+    ...     adata, 
+    ...     semisupervised=True,
+    ...     mixture_k=1,  # Custom value instead of n_labels
+    ...     override_mixture_k_in_semisupervised=False  # Respect custom mixture_k
+    ... )
 
     Notes
     -----
+    For perturbation studies, ResolVI can be trained in two modes:
+    
+    1. **Standard training**: Uses all cells (control + perturbed) for training. 
+       This learns a general representation of the cellular state space.
+       
+    2. **Perturbation-focused training**: Uses only perturbed cells for training
+       via `train(train_on_perturbed_only=True)`. Background and neighbor computations
+       still use all cells, but the training objective focuses on perturbation effects.
+       This can improve sensitivity for detecting perturbation-specific patterns.
+
     See further usage examples in the following tutorials:
 
     1. :doc:`/tutorials/notebooks/api_overview`
@@ -112,6 +166,7 @@ class RESOLVI(
         downsample_counts=True,
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
+        override_mixture_k_in_semisupervised: bool = True,
         **model_kwargs,
     ):
         pyro.clear_param_store()
@@ -231,6 +286,7 @@ class RESOLVI(
             perturbation_embed_dim=perturbation_embed_dim,
             perturbation_hidden_dim=perturbation_hidden_dim,
             perturbation_idx=perturbation_idx,
+            override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             **model_kwargs,
         )
         self._model_summary_string = (
@@ -254,6 +310,7 @@ class RESOLVI(
         n_epochs_kl_warmup: int | None = 20,
         plan_kwargs: dict | None = None,
         expose_params: list = (),
+        train_on_perturbed_only: bool = False,
         **kwargs,
     ):
         """
@@ -287,9 +344,75 @@ class RESOLVI(
             `train()` will overwrite values present in `plan_kwargs`, when appropriate.
         expose_params
             List of parameters to train if running model in Arches mode.
+        train_on_perturbed_only
+            If True, trains the model only on perturbed cells (non-control conditions).
+            Background and neighbor computations still use all cells, but the training
+            objective only sees perturbed cells. This is useful for perturbation studies
+            where you want the model to focus on learning perturbation effects.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
+        # Handle perturbation-only training
+        if train_on_perturbed_only:
+            perturbation_idx = self.module.model.perturbation_idx
+            if perturbation_idx is None:
+                raise ValueError(
+                    "train_on_perturbed_only=True requires perturbation_key to be set during setup_anndata. "
+                    "Please call RESOLVI.setup_anndata() with perturbation_key parameter."
+                )
+            
+            # Get perturbation categories from the data
+            from scvi import REGISTRY_KEYS
+            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+                cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+                if hasattr(cat_state_registry, 'field_keys'):
+                    field_keys = cat_state_registry.field_keys
+                    if perturbation_idx < len(field_keys):
+                        perturbation_key = field_keys[perturbation_idx]
+                        
+                        # Get perturbation values for all cells
+                        cell_perturbations = self.adata.obs[perturbation_key].cat.codes.values
+                        
+                        # Split cells: perturbed for training, control for validation
+                        perturbed_cell_indices = np.where(cell_perturbations != 0)[0]
+                        control_cell_indices = np.where(cell_perturbations == 0)[0]
+                        
+                        if len(perturbed_cell_indices) == 0:
+                            raise ValueError(
+                                f"No perturbed cells found. All cells have control perturbation "
+                                f"(category 0 in {perturbation_key}). Cannot train on perturbed cells only."
+                            )
+                        
+                        print(f"Training configuration with train_on_perturbed_only=True:")
+                        print(f"  Training set: {len(perturbed_cell_indices)} perturbed cells "
+                              f"({len(perturbed_cell_indices)/self.adata.n_obs*100:.1f}%)")
+                        print(f"  Validation set: {len(control_cell_indices)} control cells "
+                              f"({len(control_cell_indices)/self.adata.n_obs*100:.1f}%)")
+                        print(f"  Background/neighbor computations: all {self.adata.n_obs} cells")
+                        
+                        # Use external_indexing to provide custom train/val/test splits
+                        # ALL cells must be assigned to one of the three sets
+                        if 'datasplitter_kwargs' not in kwargs:
+                            kwargs['datasplitter_kwargs'] = {}
+                        
+                        # Provide external indexing: [train_indices, val_indices, test_indices]
+                        # Train: perturbed cells, Val: control cells, Test: empty
+                        kwargs['datasplitter_kwargs']['external_indexing'] = [
+                            perturbed_cell_indices,  # train on perturbed cells only
+                            control_cell_indices,    # validation on control cells
+                            np.array([], dtype=int), # empty test set
+                        ]
+                        
+                        # Since we're using custom validation set, ensure train_size doesn't conflict
+                        # The external_indexing will override train_size anyway
+                        
+                    else:
+                        raise ValueError(f"Perturbation index {perturbation_idx} out of range for categorical covariates")
+                else:
+                    raise ValueError("Could not find field_keys in categorical covariates state registry")
+            else:
+                raise ValueError("No categorical covariates found in data registry")
+
         blocked = self._block_parameters.copy()
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
@@ -335,6 +458,86 @@ class RESOLVI(
             batch_size=batch_size,
             **kwargs,
         )
+
+    def get_perturbation_summary(self) -> pd.DataFrame:
+        """
+        Get a summary of perturbation conditions in the dataset.
+        
+        This method helps users understand which cells have which perturbations
+        and what will happen when train_on_perturbed_only=True is used.
+        
+        Returns
+        -------
+        DataFrame with perturbation summary containing:
+        - perturbation_category: Name of the perturbation condition
+        - perturbation_code: Numeric code (0=control, >0=perturbed)
+        - n_cells: Number of cells with this condition
+        - percentage: Percentage of total cells
+        - is_control: Whether this is the control condition
+        - used_for_training: Whether cells with this condition will be used
+          when train_on_perturbed_only=True
+        """
+        perturbation_idx = self.module.model.perturbation_idx
+        if perturbation_idx is None:
+            raise ValueError(
+                "No perturbation found in categorical covariates. "
+                "Please set perturbation_key during setup_anndata."
+            )
+        
+        # Get perturbation information
+        from scvi import REGISTRY_KEYS
+        if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+            cat_state_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+            if hasattr(cat_state_registry, 'field_keys'):
+                field_keys = cat_state_registry.field_keys
+                if perturbation_idx < len(field_keys):
+                    perturbation_key = field_keys[perturbation_idx]
+                    
+                    # Get perturbation data
+                    perturbation_series = self.adata.obs[perturbation_key]
+                    category_names = perturbation_series.cat.categories.tolist()
+                    category_codes = perturbation_series.cat.codes.values
+                    
+                    # Create summary
+                    summary_data = []
+                    total_cells = len(category_codes)
+                    
+                    for code, category_name in enumerate(category_names):
+                        n_cells = np.sum(category_codes == code)
+                        percentage = (n_cells / total_cells) * 100
+                        is_control = (code == 0)  # First category is control
+                        used_for_training = not is_control  # All non-control used for training
+                        
+                        summary_data.append({
+                            'perturbation_category': category_name,
+                            'perturbation_code': code,
+                            'n_cells': n_cells,
+                            'percentage': round(percentage, 2),
+                            'is_control': is_control,
+                            'used_for_training': used_for_training
+                        })
+                    
+                    df = pd.DataFrame(summary_data)
+                    
+                    # Add summary statistics
+                    n_control = df[df['is_control']]['n_cells'].sum()
+                    n_perturbed = df[~df['is_control']]['n_cells'].sum()
+                    
+                    print(f"Perturbation Summary for key '{perturbation_key}':")
+                    print(f"  Total cells: {total_cells}")
+                    print(f"  Control cells: {n_control} ({n_control/total_cells*100:.1f}%)")
+                    print(f"  Perturbed cells: {n_perturbed} ({n_perturbed/total_cells*100:.1f}%)")
+                    print(f"\nWhen train_on_perturbed_only=True:")
+                    print(f"  - Training will use {n_perturbed} perturbed cells")
+                    print(f"  - Background/neighbor computations will still use all {total_cells} cells")
+                    
+                    return df
+                else:
+                    raise ValueError(f"Perturbation index {perturbation_idx} out of range")
+            else:
+                raise ValueError("Could not find field_keys in categorical covariates")
+        else:
+            raise ValueError("No categorical covariates found in data registry")
 
     @classmethod
     @setup_anndata_dsp.dedent
