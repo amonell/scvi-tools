@@ -416,7 +416,16 @@ class RESOLVI(
                             if background_idx is not None:
                                 # Get background values for all cells
                                 cell_backgrounds = self.adata.obs[background_key].cat.codes.values
-                                background_indices = np.where(cell_backgrounds == 0)[0]  # First category is background
+                                
+                                # Determine the correct background code based on key arrangement
+                                if background_key == perturbation_key:
+                                    # Same key: categories are [control, background, ...], so background is at index 1
+                                    background_code = 1
+                                else:
+                                    # Different key: background is at index 0
+                                    background_code = 0
+                                
+                                background_indices = np.where(cell_backgrounds == background_code)[0]
                         
                         # Identify perturbation-relevant cells (control + perturbed, excluding background)
                         all_indices = np.arange(self.adata.n_obs)
@@ -599,7 +608,16 @@ class RESOLVI(
                         if background_idx is not None:
                             # Get background values for all cells
                             cell_backgrounds = self.adata.obs[background_key].cat.codes.values
-                            background_indices = np.where(cell_backgrounds == 0)[0]  # First category is background
+                            
+                            # Determine the correct background code based on key arrangement
+                            if background_key == perturbation_key:
+                                # Same key: categories are [control, background, ...], so background is at index 1
+                                background_code = 1
+                            else:
+                                # Different key: background is at index 0
+                                background_code = 0
+                            
+                            background_indices = np.where(cell_backgrounds == background_code)[0]
 
                     # Create summary
                     summary_data = []
@@ -634,7 +652,14 @@ class RESOLVI(
                             n_cells = np.sum(background_codes == code)
                             if n_cells > 0:
                                 percentage = (n_cells / total_cells) * 100
-                                is_background = (code == 0)  # First category is background
+                                
+                                # Determine if this is the background category based on key arrangement
+                                if background_key == perturbation_key:
+                                    # Same key: background is at index 1
+                                    is_background = (code == 1)
+                                else:
+                                    # Different key: background is at index 0
+                                    is_background = (code == 0)
                                 
                                 summary_data.append({
                                     'perturbation_category': f"[Background] {category_name}",
@@ -778,29 +803,48 @@ class RESOLVI(
                 if control_perturbation not in adata.obs[perturbation_key].unique():
                     raise ValueError(f"Control perturbation '{control_perturbation}' not found in {perturbation_key}")
                 
-                # Reorder categories to put control first
-                current_categories = adata.obs[perturbation_key].cat.categories.tolist()
-                if control_perturbation in current_categories:
-                    current_categories.remove(control_perturbation)
-                    new_categories = [control_perturbation] + current_categories
+                # Check if we're using the same key for perturbation and background
+                using_same_key = (background_key is not None and perturbation_key == background_key)
+                
+                if using_same_key and background_category is not None:
+                    # Special handling when same key is used for both perturbation and background
+                    # We need to arrange categories so both control and background are in expected positions
+                    current_categories = adata.obs[perturbation_key].cat.categories.tolist()
+                    
+                    # Remove both control and background from current categories
+                    remaining_categories = [cat for cat in current_categories 
+                                          if cat not in [control_perturbation, background_category]]
+                    
+                    # Arrange: [control_perturbation, background_category, ...others]
+                    # This ensures: control=0 for perturbation logic, background=1 for background logic
+                    new_categories = [control_perturbation, background_category] + remaining_categories
                     adata.obs[perturbation_key] = adata.obs[perturbation_key].cat.reorder_categories(new_categories)
+                else:
+                    # Standard case: only perturbation_key reordering
+                    current_categories = adata.obs[perturbation_key].cat.categories.tolist()
+                    if control_perturbation in current_categories:
+                        current_categories.remove(control_perturbation)
+                        new_categories = [control_perturbation] + current_categories
+                        adata.obs[perturbation_key] = adata.obs[perturbation_key].cat.reorder_categories(new_categories)
             
             # Include perturbation in categorical covariates (avoid duplicates)
             if perturbation_key not in categorical_covariate_keys:
                 categorical_covariate_keys.append(perturbation_key)
 
-        # Handle background key if provided
+        # Handle background key if provided (skip reordering if same key as perturbation)
         if background_key is not None:
-            if background_category is not None:
-                if background_category not in adata.obs[background_key].unique():
-                    raise ValueError(f"Background category '{background_category}' not found in {background_key}")
-                
-                # Reorder categories to put background first
-                current_categories = adata.obs[background_key].cat.categories.tolist()
-                if background_category in current_categories:
-                    current_categories.remove(background_category)
-                    new_categories = [background_category] + current_categories
-                    adata.obs[background_key] = adata.obs[background_key].cat.reorder_categories(new_categories)
+            # Only reorder if it's a different key (same key was handled above)
+            if background_key != perturbation_key:
+                if background_category is not None:
+                    if background_category not in adata.obs[background_key].unique():
+                        raise ValueError(f"Background category '{background_category}' not found in {background_key}")
+                    
+                    # Reorder categories to put background first
+                    current_categories = adata.obs[background_key].cat.categories.tolist()
+                    if background_category in current_categories:
+                        current_categories.remove(background_category)
+                        new_categories = [background_category] + current_categories
+                        adata.obs[background_key] = adata.obs[background_key].cat.reorder_categories(new_categories)
             
             # Include background in categorical covariates (avoid duplicates)
             if background_key not in categorical_covariate_keys:
