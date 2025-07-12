@@ -2249,7 +2249,11 @@ class ResolVIPredictiveMixin:
                 # Apply scaling to match what's used in the model
                 scaled_delta = self.module.model.shift_scale * raw_delta
                 
-                shift_outputs.append(scaled_delta.cpu().numpy())
+                # Apply masking to zero out control cells (same logic as in model)
+                mask = (perturb_idx != 0).float().unsqueeze(-1)  # 1 → perturbed, 0 → control
+                masked_delta = scaled_delta * mask
+                
+                shift_outputs.append(masked_delta.cpu().numpy())
                 perturbation_indices.append(perturb_idx.cpu().numpy())
             else:
                 # No perturbation data - create zero shifts
@@ -2291,6 +2295,506 @@ class ResolVIPredictiveMixin:
                 pass
                 
             return df
+
+    @torch.inference_mode()
+    def get_direct_perturbation_effects(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        perturbation_list: Sequence[int] | None = None,
+        gene_list: Sequence[str] | None = None,
+        n_samples: int = 1,
+        batch_size: int | None = None,
+        return_mean: bool = True,
+        return_numpy: bool | None = None,
+        silent: bool = True,
+    ) -> np.ndarray | pd.DataFrame:
+        """
+        Get direct perturbation effects on px_rate before spatial mixing.
+        
+        This method extracts the direct effects of perturbations on the decoder output
+        (px_rate) before any spatial diffusion, background, or neighbor effects are applied.
+        This provides the closest comparison to raw shift network outputs.
+        
+        The relationship should be:
+        direct_effects ≈ shift_network_outputs / ln(2)  (converting from natural log to log2)
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        perturbation_list
+            List of perturbation indices to compare. If `None`, uses all non-control perturbations.
+        gene_list
+            Return effects for a subset of genes. If `None`, all genes are used.
+        n_samples
+            Number of posterior samples to use for estimation.
+        batch_size
+            Minibatch size for data loading into model.
+        return_mean
+            Whether to return the mean of the samples.
+        return_numpy
+            Return a numpy array instead of a pandas DataFrame.
+        silent
+            Whether to disable progress bar.
+
+        Returns
+        -------
+        Direct perturbation effects on px_rate (log2 fold changes) before spatial mixing.
+        """
+        import pyro
+        from pyro.infer import Predictive
+        
+        adata = self._validate_anndata(adata)
+        
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+            
+        # Ensure device compatibility
+        _, _, device = parse_device_args(
+            "auto", "auto", return_device="torch", validate_single_device=True
+        )
+        if next(self.module.parameters()).device != device:
+            self.module = self.module.to(device)
+
+        # Check perturbation setup
+        if "perturbation" not in self.adata_manager.data_registry:
+            raise ValueError("No perturbation found in data registry.")
+            
+        # Get perturbation info
+        setup_args_dict = self.adata_manager._get_setup_method_args()
+        from scvi.data._constants import _SETUP_ARGS_KEY
+        setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+        perturbation_key = setup_args.get('perturbation_key')
+        
+        n_perturbs = len(self.adata.obs[perturbation_key].cat.categories)
+        if perturbation_list is None:
+            if n_perturbs <= 1:
+                raise ValueError(f"Model has {n_perturbs} perturbations, need at least 2 (including control)")
+            perturbation_list = list(range(1, n_perturbs))
+            
+        gene_mask = slice(None) if gene_list is None else adata.var_names.isin(gene_list)
+        
+        if n_samples > 1 and return_mean is False:
+            if return_numpy is False:
+                warnings.warn(
+                    "`return_numpy` must be `True` if `n_samples > 1` and `return_mean` "
+                    "is`False`, returning an `np.ndarray`.",
+                    UserWarning,
+                    stacklevel=settings.warnings_stacklevel,
+                )
+            return_numpy = True
+
+        # Get fixed latent representations (same as counterfactuals for consistency)
+        z_fixed = self.get_latent_representation(
+            adata=adata, indices=indices, give_mean=True, batch_size=batch_size
+        )
+        z_fixed = torch.from_numpy(z_fixed).to(device)
+        
+        # Create data loader
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        
+        all_effects = []
+        
+        for tensors in track(scdl, disable=silent):
+            _, kwargs = self.module._get_fn_args_from_batch(tensors)
+            kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
+            
+            batch_size_actual = kwargs["x"].shape[0]
+            z_batch = z_fixed[:batch_size_actual, :]
+
+            # Get baseline control px_rate
+            if kwargs["cat_covs"] is not None:
+                categorical_input = list(torch.split(kwargs["cat_covs"], 1, dim=1))
+            else:
+                categorical_input = ()
+                
+            # Sample latent if needed for n_samples > 1
+            if n_samples > 1:
+                z_samples = z_batch.unsqueeze(0).expand(n_samples, -1, -1)  # [n_samples, batch_size, n_latent]
+            else:
+                z_samples = z_batch.unsqueeze(0)  # [1, batch_size, n_latent]
+            
+            batch_effects = []
+            
+            for sample_idx in range(n_samples):
+                z_sample = z_samples[sample_idx]  # [batch_size, n_latent]
+                
+                # Get control px_rate (no perturbation)
+                px_scale_control, _, px_rate_control, _ = self.module.model.decoder(
+                    self.module.model.dispersion,
+                    z_sample,
+                    kwargs["library"],
+                    kwargs["batch_index"],
+                    *categorical_input,
+                )
+                
+                sample_effects = []
+                for perturb_idx in perturbation_list:
+                    # Get perturbation embedding and shift
+                    perturb_tensor = torch.full(
+                        (batch_size_actual,), perturb_idx, device=device, dtype=torch.long
+                    )
+                    u_k = self.module.model.perturb_emb(perturb_tensor)
+                    delta = self.module.model.shift_scale * self.module.model.shift_net(
+                        torch.cat([z_sample, u_k], dim=-1)
+                    )
+                    
+                    # Apply shift to get perturbed px_rate
+                    log_px_rate_base = torch.log(px_rate_control + 1e-8)
+                    log_px_rate_perturbed = log_px_rate_base + delta  # No masking since all are perturbed
+                    px_rate_perturbed = torch.exp(log_px_rate_perturbed)
+                    
+                    # Compute log fold change
+                    eps = 1e-8
+                    control_safe = torch.clamp(px_rate_control, min=eps)
+                    perturbed_safe = torch.clamp(px_rate_perturbed, min=eps)
+                    
+                    log_fc = torch.log2(perturbed_safe / control_safe)  # [batch_size, n_genes]
+                    log_fc = log_fc[..., gene_mask]
+                    
+                    sample_effects.append(log_fc.cpu().numpy())
+                
+                batch_effects.append(np.stack(sample_effects, axis=0))  # [n_perturbs, batch_size, n_genes]
+            
+            all_effects.append(np.stack(batch_effects, axis=0))  # [n_samples, n_perturbs, batch_size, n_genes]
+        
+        # Concatenate across batches
+        effects = np.concatenate(all_effects, axis=2)  # [n_samples, n_perturbs, n_cells, n_genes]
+        
+        # Average across cells (to match typical perturbation effect format)
+        effects = effects.mean(axis=2)  # [n_samples, n_perturbs, n_genes]
+        
+        if return_mean:
+            effects = effects.mean(axis=0)  # [n_perturbs, n_genes]
+
+        if return_numpy is None or return_numpy is False:
+            gene_names = adata.var_names[gene_mask] if gene_list is not None else adata.var_names
+            perturbation_names = [f"perturbation_{i}" for i in perturbation_list]
+            
+            if return_mean:
+                return pd.DataFrame(
+                    effects, index=perturbation_names, columns=gene_names
+                )
+            else:
+                return effects
+        else:
+            return effects
+
+    @torch.inference_mode()
+    def check_control_penalty_effectiveness(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        batch_size: int | None = None,
+        silent: bool = True,
+    ) -> dict:
+        """
+        Check if the control penalty is working effectively.
+        
+        This method helps verify that the control penalty is encouraging
+        the shift network to produce zero outputs for control perturbations.
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        batch_size
+            Minibatch size for data loading into model.
+        silent
+            Whether to disable progress bar.
+
+        Returns
+        -------
+        Dictionary with control penalty effectiveness metrics:
+        - control_shift_stats: Statistics of shift outputs for control cells
+        - perturbed_shift_stats: Statistics of shift outputs for perturbed cells
+        - control_penalty_weight: Current penalty weight
+        - effectiveness_score: How well the penalty is working (lower is better)
+        """
+        adata = self._validate_anndata(adata)
+        
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+            
+        # Get shift network outputs
+        shift_outputs = self.get_shift_network_outputs(
+            adata=adata, indices=indices, batch_size=batch_size, silent=silent
+        )
+        
+        # Get perturbation indices
+        perturbation_indices = shift_outputs.attrs.get('perturbation_indices', None)
+        if perturbation_indices is None:
+            raise ValueError("No perturbation indices found in shift outputs")
+        
+        # Separate control and perturbed cells
+        control_mask = perturbation_indices == 0
+        perturbed_mask = perturbation_indices != 0
+        
+        if not np.any(control_mask):
+            raise ValueError("No control cells found in the data")
+        
+        if not np.any(perturbed_mask):
+            raise ValueError("No perturbed cells found in the data")
+        
+        # Convert to numpy if needed
+        if isinstance(shift_outputs, pd.DataFrame):
+            shift_array = shift_outputs.values
+        else:
+            shift_array = shift_outputs
+        
+        # Compute statistics
+        control_shifts = shift_array[control_mask]
+        perturbed_shifts = shift_array[perturbed_mask]
+        
+        control_stats = {
+            'mean': float(np.mean(control_shifts)),
+            'std': float(np.std(control_shifts)),
+            'min': float(np.min(control_shifts)),
+            'max': float(np.max(control_shifts)),
+            'n_cells': int(np.sum(control_mask)),
+            'non_zero_fraction': float(np.mean(control_shifts != 0))
+        }
+        
+        perturbed_stats = {
+            'mean': float(np.mean(perturbed_shifts)),
+            'std': float(np.std(perturbed_shifts)),
+            'min': float(np.min(perturbed_shifts)),
+            'max': float(np.max(perturbed_shifts)),
+            'n_cells': int(np.sum(perturbed_mask)),
+            'non_zero_fraction': float(np.mean(perturbed_shifts != 0))
+        }
+        
+        # Effectiveness score: lower is better (closer to zero for control)
+        effectiveness_score = np.mean(control_shifts ** 2)  # L2 norm of control shifts
+        
+        # Get current penalty weight
+        control_penalty_weight = getattr(self.module.model, 'control_penalty_weight', None)
+        
+        return {
+            'control_shift_stats': control_stats,
+            'perturbed_shift_stats': perturbed_stats,
+            'control_penalty_weight': control_penalty_weight,
+            'effectiveness_score': float(effectiveness_score),
+            'recommendation': 'Lower penalty weight' if effectiveness_score > 0.1 else 'Penalty working well'
+        }
+
+    @torch.inference_mode()
+    def compare_shift_outputs_vs_effects(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        perturbation_list: Sequence[int] | None = None,
+        gene_list: Sequence[str] | None = None,
+        n_samples: int = 5,
+        batch_size: int | None = None,
+    ) -> dict:
+        """
+        Compare shift network outputs with different types of perturbation effects.
+        
+        This method helps debug why shift network outputs might not correlate well
+        with counterfactual effects by comparing them at different levels of the model.
+        
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        perturbation_list
+            List of perturbation indices to compare. If `None`, uses all non-control perturbations.
+        gene_list
+            Return effects for a subset of genes. If `None`, all genes are used.
+        n_samples
+            Number of posterior samples to use for estimation.
+        batch_size
+            Minibatch size for data loading into model.
+            
+        Returns
+        -------
+        Dictionary containing:
+        - 'shift_outputs': Raw shift network outputs (delta values)
+        - 'direct_effects': Direct px_rate effects (before spatial mixing)
+        - 'full_counterfactuals': Full counterfactual effects (with spatial mixing)
+        - 'correlations': Correlation matrix between different measures
+        - 'expected_relationship': Theoretical relationship between measures
+        """
+        print("🔍 Comparing shift network outputs vs different perturbation effects...")
+        print("This will help identify where the correlation breaks down.")
+        
+        # Get all different measures
+        print("\n1️⃣ Getting raw shift network outputs...")
+        shift_outputs = self.get_shift_network_outputs(
+            adata=adata, indices=indices, batch_size=batch_size, return_numpy=True
+        )
+        
+        print("2️⃣ Getting direct px_rate effects (before spatial mixing)...")
+        direct_effects = self.get_direct_perturbation_effects(
+            adata=adata, indices=indices, perturbation_list=perturbation_list,
+            gene_list=gene_list, n_samples=n_samples, batch_size=batch_size,
+            return_numpy=True, return_mean=True
+        )
+        
+        print("3️⃣ Getting full counterfactual effects (with spatial mixing)...")
+        full_effects = self.get_perturbation_effects(
+            adata=adata, indices=indices, perturbation_list=perturbation_list,
+            gene_list=gene_list, n_samples=n_samples, batch_size=batch_size,
+            return_numpy=True, return_mean=True
+        )
+        
+        # Filter shift outputs to match perturbation cells and perturbations
+        if perturbation_list is None:
+            # Get perturbation info
+            setup_args_dict = self.adata_manager._get_setup_method_args()
+            from scvi.data._constants import _SETUP_ARGS_KEY
+            setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+            perturbation_key = setup_args.get('perturbation_key')
+            
+            n_perturbs = len(self.adata.obs[perturbation_key].cat.categories)
+            perturbation_list = list(range(1, n_perturbs))
+        
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+            
+        # Get perturbation assignments for cells
+        setup_args_dict = self.adata_manager._get_setup_method_args()
+        from scvi.data._constants import _SETUP_ARGS_KEY
+        setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+        perturbation_key = setup_args.get('perturbation_key')
+        
+        if perturbation_key and perturbation_key in adata.obs.columns:
+            cell_perturbations = adata.obs.iloc[indices][perturbation_key].cat.codes.values
+        else:
+            cell_perturbations = np.zeros(len(indices), dtype=int)
+        
+        # Apply gene mask if specified
+        if gene_list is not None:
+            gene_mask = adata.var_names.isin(gene_list)
+            shift_outputs = shift_outputs[:, gene_mask]
+        
+        # For each perturbation, extract corresponding shift outputs and compare
+        comparisons = {}
+        overall_correlations = {}
+        
+        print("\n4️⃣ Computing correlations for each perturbation...")
+        
+        for i, perturb_idx in enumerate(perturbation_list):
+            print(f"   📊 Perturbation {perturb_idx}...")
+            
+            # Find cells with this perturbation
+            perturb_mask = cell_perturbations == perturb_idx
+            perturb_cells = np.where(perturb_mask)[0]
+            
+            if len(perturb_cells) == 0:
+                print(f"   ⚠️ No cells found with perturbation {perturb_idx}")
+                continue
+                
+            # Get shift outputs for these cells
+            shift_perturb = shift_outputs[perturb_cells, :]  # [n_cells, n_genes]
+            
+            # Average across cells to match perturbation effects format
+            shift_avg = shift_perturb.mean(axis=0)  # [n_genes]
+            
+            # Get corresponding effects
+            direct_eff = direct_effects[i, :]  # [n_genes]
+            full_eff = full_effects[i, :]  # [n_genes]
+            
+            # Expected relationship: direct_effects ≈ shift_outputs / ln(2)
+            expected_direct = shift_avg / np.log(2)
+            
+            # Compute correlations
+            corr_shift_direct = np.corrcoef(shift_avg, direct_eff)[0, 1]
+            corr_shift_expected = np.corrcoef(shift_avg, expected_direct)[0, 1]
+            corr_direct_full = np.corrcoef(direct_eff, full_eff)[0, 1]
+            corr_shift_full = np.corrcoef(shift_avg, full_eff)[0, 1]
+            corr_expected_direct = np.corrcoef(expected_direct, direct_eff)[0, 1]
+            
+            comparisons[f'perturbation_{perturb_idx}'] = {
+                'shift_outputs': shift_avg,
+                'direct_effects': direct_eff,
+                'full_effects': full_eff,
+                'expected_direct': expected_direct,
+                'n_cells': len(perturb_cells),
+                'correlations': {
+                    'shift_vs_direct': corr_shift_direct,
+                    'shift_vs_expected': corr_shift_expected,
+                    'direct_vs_full': corr_direct_full,
+                    'shift_vs_full': corr_shift_full,
+                    'expected_vs_direct': corr_expected_direct,
+                }
+            }
+            
+            print(f"     • Shift vs Direct:     {corr_shift_direct:.3f}")
+            print(f"     • Shift vs Expected:   {corr_shift_expected:.3f}")
+            print(f"     • Expected vs Direct:  {corr_expected_direct:.3f}")
+            print(f"     • Direct vs Full:      {corr_direct_full:.3f}")
+            print(f"     • Shift vs Full:       {corr_shift_full:.3f}")
+        
+        # Compute overall correlations across all perturbations/genes
+        print("\n5️⃣ Computing overall correlations...")
+        
+        all_shifts = []
+        all_direct = []
+        all_full = []
+        all_expected = []
+        
+        for perturb_data in comparisons.values():
+            all_shifts.extend(perturb_data['shift_outputs'])
+            all_direct.extend(perturb_data['direct_effects'])
+            all_full.extend(perturb_data['full_effects'])
+            all_expected.extend(perturb_data['expected_direct'])
+        
+        all_shifts = np.array(all_shifts)
+        all_direct = np.array(all_direct)
+        all_full = np.array(all_full)
+        all_expected = np.array(all_expected)
+        
+        overall_correlations = {
+            'shift_vs_direct': np.corrcoef(all_shifts, all_direct)[0, 1],
+            'shift_vs_expected': np.corrcoef(all_shifts, all_expected)[0, 1],
+            'expected_vs_direct': np.corrcoef(all_expected, all_direct)[0, 1],
+            'direct_vs_full': np.corrcoef(all_direct, all_full)[0, 1],
+            'shift_vs_full': np.corrcoef(all_shifts, all_full)[0, 1],
+        }
+        
+        print(f"📈 Overall correlations across all perturbations:")
+        for key, corr in overall_correlations.items():
+            print(f"   • {key}: {corr:.3f}")
+        
+        # Provide interpretation
+        print("\n🔬 Interpretation:")
+        print("   • shift_vs_expected should be ≈1.0 (theoretical relationship)")
+        print("   • expected_vs_direct should be ≈1.0 (if theory matches implementation)")
+        print("   • direct_vs_full shows impact of spatial mixing")
+        print("   • shift_vs_full shows end-to-end correlation")
+        
+        if overall_correlations['expected_vs_direct'] < 0.9:
+            print("   ⚠️ Low expected_vs_direct correlation suggests implementation differences")
+        if overall_correlations['direct_vs_full'] < 0.8:
+            print("   📍 Spatial mixing significantly affects final counterfactuals")
+        if overall_correlations['shift_vs_full'] < 0.6:
+            print("   🎯 Poor shift_vs_full correlation confirms the original issue")
+        
+        return {
+            'comparisons': comparisons,
+            'overall_correlations': overall_correlations,
+            'summary_stats': {
+                'n_perturbations': len(comparisons),
+                'total_comparisons': len(all_shifts),
+                'shift_range': (all_shifts.min(), all_shifts.max()),
+                'direct_range': (all_direct.min(), all_direct.max()),
+                'full_range': (all_full.min(), all_full.max()),
+            },
+            'interpretation': {
+                'theoretical_relationship': 'direct_effects = shift_outputs / ln(2)',
+                'spatial_impact': f"{(1 - overall_correlations['direct_vs_full']) * 100:.1f}% effect modification by spatial mixing",
+                'implementation_match': overall_correlations['expected_vs_direct'] > 0.9,
+            }
+        }
 
 def bayesian_perturbation_analysis_example():
     """

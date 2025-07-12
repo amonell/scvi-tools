@@ -21,6 +21,7 @@ from pyro.distributions import (
     constraints,
 )
 from pyro.nn import PyroModule
+from pyro.infer import Trace_ELBO
 
 from scvi import REGISTRY_KEYS
 from scvi.dataloaders import AnnTorchDataset
@@ -29,6 +30,45 @@ from scvi.module.base import PyroBaseModuleClass, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder
 
 _RESOLVAE_PYRO_MODULE_NAME = "resolvae"
+
+
+class ControlPenaltyELBO(Trace_ELBO):
+    """
+    Custom ELBO loss function that includes a penalty for non-zero control perturbation shifts.
+    
+    This encourages the shift network to produce zero outputs for control perturbations,
+    making the model more interpretable and robust.
+    """
+    
+    def __init__(self, control_penalty_weight: float = 1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.control_penalty_weight = control_penalty_weight
+    
+    def loss(self, model, guide, *args, **kwargs):
+        """
+        Compute the ELBO loss plus control penalty.
+        """
+        # Get the standard ELBO loss
+        elbo_loss = super().loss(model, guide, *args, **kwargs)
+        
+        # Extract control shifts from the trace
+        trace = self._get_trace(model, guide, *args, **kwargs)
+        
+        # Check if control_shifts exists in the trace
+        if "control_shifts" in trace.nodes:
+            control_shifts = trace.nodes["control_shifts"]["value"]
+            
+            # Compute control penalty: penalize non-zero shifts for control cells
+            # Use L2 penalty on control shift outputs
+            control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
+            
+            # Add penalty to ELBO loss
+            total_loss = elbo_loss + control_penalty
+        else:
+            # No control shifts found, just return ELBO loss
+            total_loss = elbo_loss
+        
+        return total_loss
 
 
 def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-8) -> torch.Tensor:
@@ -184,6 +224,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_hidden_dim: int = 64,
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
+        control_penalty_weight: float = 1.0,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -205,6 +246,7 @@ class RESOLVAEModel(PyroModule):
         self.encode_covariates = encode_covariates
         self.n_perturbs = n_perturbs
         self.perturbation_idx = perturbation_idx  # Index of perturbation in cat_covs
+        self.control_penalty_weight = control_penalty_weight
         
         # Perturbation embedding and shift network
         self.perturb_emb = torch.nn.Embedding(n_perturbs, perturbation_embed_dim)
@@ -534,6 +576,12 @@ class RESOLVAEModel(PyroModule):
                 
                 delta = self.shift_scale * self.shift_net(torch.cat([z, u_k], dim=-1))  # Scale constrained output
                 
+                # Store control shift outputs for penalty calculation
+                control_mask = (perturbation_data == 0).float().unsqueeze(-1)  # 1 → control, 0 → perturbed
+                if z.ndim == 3:  # particles dimension
+                    control_mask = control_mask.unsqueeze(0)
+                control_shifts = delta * control_mask  # Only control cell shifts
+                
                 # Only add shift for non-zero perturbation indices (assuming 0 = control)
                 mask  = (perturbation_data != 0).float().unsqueeze(-1)         # 1 → perturbed, 0 → control
                 if z.ndim == 3:                                                 # particles dimension
@@ -544,6 +592,9 @@ class RESOLVAEModel(PyroModule):
                 log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
                 log_px_rate = log_px_rate_base + mask * delta
                 px_rate = torch.exp(log_px_rate)
+                
+                # Store control shifts for loss computation
+                pyro.deterministic("control_shifts", control_shifts, event_dim=1)
 
             if self.semisupervised:
                 probs_prediction_ = self.classifier(z)
@@ -1196,6 +1247,7 @@ class RESOLVAE(PyroBaseModuleClass):
         perturbation_hidden_dim: int = 64,
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
+        control_penalty_weight: float = 1.0,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1285,6 +1337,7 @@ class RESOLVAE(PyroBaseModuleClass):
             perturbation_hidden_dim=perturbation_hidden_dim,
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
+            control_penalty_weight=control_penalty_weight,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 

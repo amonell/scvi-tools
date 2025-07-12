@@ -27,7 +27,7 @@ from scvi.model.base import ArchesMixin, BaseModelClass, PyroSampleMixin, PyroSv
 from scvi.model.base._de_core import _de_core
 from scvi.utils import de_dsp, setup_anndata_dsp
 
-from ._module import RESOLVAE
+from ._module import RESOLVAE, ControlPenaltyELBO
 from ._utils import ResolVIPredictiveMixin
 
 if TYPE_CHECKING:
@@ -186,6 +186,7 @@ class RESOLVI(
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
         override_mixture_k_in_semisupervised: bool = True,
+        control_penalty_weight: float = 1.0,
         **model_kwargs,
     ):
         pyro.clear_param_store()
@@ -266,6 +267,7 @@ class RESOLVI(
             perturbation_hidden_dim=perturbation_hidden_dim,
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
+            control_penalty_weight=control_penalty_weight,
             **model_kwargs,
         )
         self._model_summary_string = (
@@ -473,7 +475,8 @@ class RESOLVI(
                 if n_epochs_kl_warmup is not None
                 else max_epochs,
                 "n_steps_kl_warmup": n_steps_kl_warmup,
-                "loss_fn": Trace_ELBO(
+                "loss_fn": ControlPenaltyELBO(
+                    control_penalty_weight=self.module.model.control_penalty_weight,
                     num_particles=5, vectorize_particles=True, retain_graph=True
                 ),
             }
