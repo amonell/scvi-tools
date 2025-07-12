@@ -64,9 +64,27 @@ class ControlPenaltyELBO(Trace_ELBO):
             
             # Add penalty to ELBO loss
             total_loss = elbo_loss + control_penalty
+            
+            # Debug: print penalty info (only occasionally to avoid spam)
+            if hasattr(self, '_debug_counter'):
+                self._debug_counter += 1
+            else:
+                self._debug_counter = 0
+                
+            if self._debug_counter % 1 == 0:  # Print every 100 iterations
+                print(f"Control penalty debug:")
+                print(f"  - Control shifts shape: {control_shifts.shape}")
+                print(f"  - Control shifts mean: {control_shifts.mean().item():.6f}")
+                print(f"  - Control shifts std: {control_shifts.std().item():.6f}")
+                print(f"  - Control shifts max: {control_shifts.max().item():.6f}")
+                print(f"  - Control penalty: {control_penalty.item():.6f}")
+                print(f"  - ELBO loss: {elbo_loss.item():.6f}")
+                print(f"  - Total loss: {total_loss.item():.6f}")
+                print(f"  - Penalty weight: {self.control_penalty_weight}")
         else:
             # No control shifts found, just return ELBO loss
             total_loss = elbo_loss
+            print("WARNING: No control_shifts found in trace!")
         
         return total_loss
 
@@ -580,17 +598,13 @@ class RESOLVAEModel(PyroModule):
                 control_mask = (perturbation_data == 0).float().unsqueeze(-1)  # 1 → control, 0 → perturbed
                 if z.ndim == 3:  # particles dimension
                     control_mask = control_mask.unsqueeze(0)
-                control_shifts = delta * control_mask  # Only control cell shifts
+                control_shifts = delta * control_mask  # Control shifts for penalty
                 
-                # Only add shift for non-zero perturbation indices (assuming 0 = control)
-                mask  = (perturbation_data != 0).float().unsqueeze(-1)         # 1 → perturbed, 0 → control
-                if z.ndim == 3:                                                 # particles dimension
-                    mask = mask.unsqueeze(0)
-                
+                # Apply shifts to ALL cells (no masking - let network learn everything)
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
                 # This ensures λ > 0 even with negative δ
                 log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
-                log_px_rate = log_px_rate_base + mask * delta
+                log_px_rate = log_px_rate_base + delta  # No masking - apply to all cells
                 px_rate = torch.exp(log_px_rate)
                 
                 # Store control shifts for loss computation

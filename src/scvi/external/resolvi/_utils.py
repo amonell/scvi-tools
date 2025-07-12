@@ -2249,11 +2249,8 @@ class ResolVIPredictiveMixin:
                 # Apply scaling to match what's used in the model
                 scaled_delta = self.module.model.shift_scale * raw_delta
                 
-                # Apply masking to zero out control cells (same logic as in model)
-                mask = (perturb_idx != 0).float().unsqueeze(-1)  # 1 → perturbed, 0 → control
-                masked_delta = scaled_delta * mask
-                
-                shift_outputs.append(masked_delta.cpu().numpy())
+                # No masking - return raw network outputs (network should learn control = 0)
+                shift_outputs.append(scaled_delta.cpu().numpy())
                 perturbation_indices.append(perturb_idx.cpu().numpy())
             else:
                 # No perturbation data - create zero shifts
@@ -2580,7 +2577,8 @@ class ResolVIPredictiveMixin:
             'perturbed_shift_stats': perturbed_stats,
             'control_penalty_weight': control_penalty_weight,
             'effectiveness_score': float(effectiveness_score),
-            'recommendation': 'Lower penalty weight' if effectiveness_score > 0.1 else 'Penalty working well'
+            'recommendation': 'Increase penalty weight' if effectiveness_score > 0.1 else 'Penalty working well',
+            'suggested_weight': max(10.0, control_penalty_weight * 10) if effectiveness_score > 0.1 else control_penalty_weight
         }
 
     @torch.inference_mode()
