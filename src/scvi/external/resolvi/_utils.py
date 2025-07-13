@@ -2242,12 +2242,29 @@ class ResolVIPredictiveMixin:
             # Get perturbation data and embeddings
             if kwargs["perturbation_data"] is not None:
                 perturb_idx = kwargs["perturbation_data"].long()
-                u_k = self.module.model.perturb_emb(perturb_idx)
                 
-                # Get raw shift network outputs (before scaling)
-                raw_delta = self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
-                # Apply scaling to match what's used in the model
-                scaled_delta = self.module.model.shift_scale * raw_delta
+                # Handle background cells (marked as -1) - they should have zero shifts
+                background_mask = (perturb_idx == -1)
+                active_mask = ~background_mask
+                
+                if active_mask.any():
+                    # Only process non-background cells through shift network
+                    active_perturb_idx = perturb_idx[active_mask]
+                    active_z = z[active_mask]
+                    
+                    u_k = self.module.model.perturb_emb(active_perturb_idx)
+                    
+                    # Get raw shift network outputs (before scaling)
+                    raw_delta = self.module.model.shift_net(torch.cat([active_z, u_k], dim=-1))
+                    # Apply scaling to match what's used in the model
+                    active_scaled_delta = self.module.model.shift_scale * raw_delta
+                    
+                    # Create full delta tensor with zeros for background cells
+                    scaled_delta = torch.zeros(z.shape[0], self.module.model.n_input, device=z.device)
+                    scaled_delta[active_mask] = active_scaled_delta
+                else:
+                    # All cells are background - no shifts
+                    scaled_delta = torch.zeros(z.shape[0], self.module.model.n_input, device=z.device)
                 
                 # No masking - return raw network outputs (network should learn control = 0)
                 shift_outputs.append(scaled_delta.cpu().numpy())
@@ -2529,8 +2546,9 @@ class ResolVIPredictiveMixin:
             raise ValueError("No perturbation indices found in shift outputs")
         
         # Separate control and perturbed cells
+        # Note: background cells are marked as -1 and should be excluded
         control_mask = perturbation_indices == 0
-        perturbed_mask = perturbation_indices != 0
+        perturbed_mask = (perturbation_indices != 0) & (perturbation_indices != -1)
         
         if not np.any(control_mask):
             raise ValueError("No control cells found in the data")

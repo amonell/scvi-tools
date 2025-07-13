@@ -270,6 +270,13 @@ class RESOLVI(
             control_penalty_weight=control_penalty_weight,
             **model_kwargs,
         )
+        
+        # Set key information for background handling
+        setup_args_dict = self.adata_manager._get_setup_method_args()
+        from scvi.data._constants import _SETUP_ARGS_KEY
+        setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+        self.module.model.background_key = setup_args.get('background_key')
+        self.module.model.perturbation_key = setup_args.get('perturbation_key')
         self._model_summary_string = (
             f"RESOLVI Model with the following params: \nn_hidden: {n_hidden} "
             f"n_latent: {n_latent}, n_layers: {n_layers}, dropout_rate: "
@@ -380,6 +387,8 @@ class RESOLVI(
             perturbation_relevant_indices = np.setdiff1d(all_indices, background_indices)
             
             # Split perturbation-relevant cells into control and perturbed
+            # Note: When using same key, background cells are marked as -1 in perturbation_data
+            # but we need to use the original cell_perturbations for this logic
             control_cell_indices = np.intersect1d(
                 perturbation_relevant_indices,
                 np.where(cell_perturbations == 0)[0]
@@ -540,26 +549,38 @@ class RESOLVI(
             # Determine the correct background code based on key arrangement
             if background_key == perturbation_key:
                 # Same key: categories are [control, background, ...], so background is at index 1
+                # But in the model, background cells are marked as -1
                 background_code = 1
+                # Find cells that would be background (index 1 in original data)
+                background_indices = np.where(cell_backgrounds == background_code)[0]
             else:
                 # Different key: background is at index 0
                 background_code = 0
-            
-            background_indices = np.where(cell_backgrounds == background_code)[0]
+                background_indices = np.where(cell_backgrounds == background_code)[0]
 
         # Create summary
         summary_data = []
         total_cells = len(category_codes)
+        
+        # Check if we're using the same key for perturbation and background
+        using_same_key = (background_key is not None and perturbation_key == background_key)
         
         for code, category_name in enumerate(category_names):
             n_cells = np.sum(category_codes == code)
             percentage = (n_cells / total_cells) * 100
             is_control = (code == 0)  # First category is control
             
+            # Determine if this is a background category
+            if using_same_key:
+                # Same key: background is at index 1
+                is_background = (code == 1)
+            else:
+                # Different key: not a background category in perturbation field
+                is_background = False
+            
             # Both control and perturbed cells are used for training in train_on_perturbed_only mode
             # Background cells are excluded from training
-            used_for_training = True  # Both control and perturbed used for training
-            is_background = False
+            used_for_training = not is_background  # Background cells excluded from training
             
             summary_data.append({
                 'perturbation_category': category_name,
@@ -571,8 +592,8 @@ class RESOLVI(
                 'is_background': is_background
             })
         
-        # Add background information if available
-        if len(background_indices) > 0 and background_key:
+        # Add background information if available (only for different keys)
+        if len(background_indices) > 0 and background_key and background_key != perturbation_key:
             background_categories = self.adata.obs[background_key].cat.categories.tolist()
             background_codes = self.adata.obs[background_key].cat.codes.values
             
@@ -581,13 +602,8 @@ class RESOLVI(
                 if n_cells > 0:
                     percentage = (n_cells / total_cells) * 100
                     
-                    # Determine if this is the background category based on key arrangement
-                    if background_key == perturbation_key:
-                        # Same key: background is at index 1
-                        is_background = (code == 1)
-                    else:
-                        # Different key: background is at index 0
-                        is_background = (code == 0)
+                    # Different key: background is at index 0
+                    is_background = (code == 0)
                     
                     summary_data.append({
                         'perturbation_category': f"[Background] {category_name}",
@@ -602,7 +618,7 @@ class RESOLVI(
         df = pd.DataFrame(summary_data)
         
         # Add summary statistics
-        n_control = df[(df['is_control']) & (~df['is_background'])]['n_cells'].sum()
+        n_control = df[df['is_control']]['n_cells'].sum()
         n_perturbed = df[(~df['is_control']) & (~df['is_background'])]['n_cells'].sum()
         n_background = df[df['is_background']]['n_cells'].sum()
         n_perturbation_relevant = n_control + n_perturbed

@@ -32,62 +32,50 @@ from scvi.nn import DecoderSCVI, Encoder
 _RESOLVAE_PYRO_MODULE_NAME = "resolvae"
 
 
+from pyro.infer import Trace_ELBO
+
 class ControlPenaltyELBO(Trace_ELBO):
-    """
-    Custom ELBO loss function that includes a penalty for non-zero control perturbation shifts.
-    
-    This encourages the shift network to produce zero outputs for control perturbations,
-    making the model more interpretable and robust.
-    """
-    
     def __init__(self, control_penalty_weight: float = 1.0, **kwargs):
         super().__init__(**kwargs)
         self.control_penalty_weight = control_penalty_weight
-    
+
     def loss(self, model, guide, *args, **kwargs):
         """
-        Compute the ELBO loss plus control penalty.
+        Computes the ELBO loss with control penalty.
         """
-        # Get the standard ELBO loss
-        elbo_loss = super().loss(model, guide, *args, **kwargs)
+        elbo_loss = 0.0
+        control_penalty = 0.0
         
-        # Extract control shifts from the trace
-        trace = self._get_trace(model, guide, *args, **kwargs)
+        # Use parent class's _get_traces method
+        for guide_trace, model_trace in self._get_traces(model, guide, args, kwargs):
+            elbo_particle = guide_trace.log_prob_sum() - model_trace.log_prob_sum()
+            elbo_loss += elbo_particle / self.num_particles
+
+        with pyro.poutine.trace() as tr:
+            model(*args, **kwargs)
+        separate_trace = tr.trace
         
-        # Check if control_shifts exists in the trace
-        if "control_shifts" in trace.nodes:
-            control_shifts = trace.nodes["control_shifts"]["value"]
-            
-            # Compute control penalty: penalize non-zero shifts for control cells
-            # Use L2 penalty on control shift outputs
-            control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
-            
-            # Add penalty to ELBO loss
-            total_loss = elbo_loss + control_penalty
-            
-            # Debug: print penalty info (only occasionally to avoid spam)
-            if hasattr(self, '_debug_counter'):
-                self._debug_counter += 1
-            else:
-                self._debug_counter = 0
-                
-            if self._debug_counter % 1 == 0:  # Print every 100 iterations
-                print(f"Control penalty debug:")
-                print(f"  - Control shifts shape: {control_shifts.shape}")
-                print(f"  - Control shifts mean: {control_shifts.mean().item():.6f}")
-                print(f"  - Control shifts std: {control_shifts.std().item():.6f}")
-                print(f"  - Control shifts max: {control_shifts.max().item():.6f}")
-                print(f"  - Control penalty: {control_penalty.item():.6f}")
-                print(f"  - ELBO loss: {elbo_loss.item():.6f}")
-                print(f"  - Total loss: {total_loss.item():.6f}")
-                print(f"  - Penalty weight: {self.control_penalty_weight}")
-        else:
-            # No control shifts found, just return ELBO loss
-            total_loss = elbo_loss
-            print("WARNING: No control_shifts found in trace!")
+        if "control_penalty" in separate_trace.nodes:
+            penalty_value = separate_trace.nodes["control_penalty"]["value"]
+            control_penalty = penalty_value
+
         
+        # Return total loss (ELBO + control penalty)
+        total_loss = -elbo_loss + control_penalty
+
         return total_loss
 
+    def loss_and_grads(self, model, guide, *args, **kwargs):
+        """
+        Computes the loss and gradients for the total loss (ELBO + control penalty).
+        """
+        # Compute total loss
+        total_loss = self.loss(model, guide, *args, **kwargs)
+        
+        # Compute gradients on the total loss
+        total_loss.backward()
+        
+        return total_loss
 
 def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-8) -> torch.Tensor:
     """
@@ -242,7 +230,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_hidden_dim: int = 64,
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
-        control_penalty_weight: float = 1.0,
+        control_penalty_weight: float = 10.0,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -265,6 +253,10 @@ class RESOLVAEModel(PyroModule):
         self.n_perturbs = n_perturbs
         self.perturbation_idx = perturbation_idx  # Index of perturbation in cat_covs
         self.control_penalty_weight = control_penalty_weight
+        
+        # Store key information for background handling
+        self.background_key = None  # Will be set by setup_anndata
+        self.perturbation_key = None  # Will be set by setup_anndata
         
         # Perturbation embedding and shift network
         self.perturb_emb = torch.nn.Embedding(n_perturbs, perturbation_embed_dim)
@@ -365,6 +357,28 @@ class RESOLVAEModel(PyroModule):
         perturbation_data = tensor_dict.get("perturbation", None)
         if perturbation_data is not None:
             perturbation_data = perturbation_data.long().ravel()
+            
+            # Handle the case where background_key is the same as perturbation_key
+            # In this case, the background category (index 1) should be excluded from perturbation logic
+            # We need to remap the perturbation codes to exclude background
+            if hasattr(self, 'background_key') and hasattr(self, 'perturbation_key'):
+                if self.background_key == self.perturbation_key:
+                    # Create a mapping that excludes background (index 1)
+                    # Original: [control=0, background=1, perturb1=2, perturb2=3, ...]
+                    # New: [control=0, perturb1=1, perturb2=2, ...] (background becomes -1 or special value)
+                    background_mask = (perturbation_data == 1)  # Background is at index 1
+                    
+                    # For background cells, set perturbation to a special value (-1) to exclude from shift network
+                    # For non-background cells, remap: 0->0 (control), 2->1, 3->2, etc.
+                    remapped_perturbation = perturbation_data.clone()
+                    remapped_perturbation[background_mask] = -1  # Mark background cells
+                    
+                    # Remap non-background, non-control cells
+                    non_background_mask = ~background_mask & (perturbation_data > 1)
+                    if non_background_mask.any():
+                        remapped_perturbation[non_background_mask] = perturbation_data[non_background_mask] - 1
+                    
+                    perturbation_data = remapped_perturbation
         else:
             # If no perturbation data, treat all cells as control (index 0)
             perturbation_data = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
@@ -545,7 +559,7 @@ class RESOLVAEModel(PyroModule):
                 else:
                     # Custom mixture_k case: map labels to available mixture components
                     if current_mixture_k == 1:
-                        # Single mixture component: all cells get same treatment
+                        # Single mixture component: all cells use the same mixture component
                         logits_input = torch.ones(x.shape[0], 1, device=x.device)
                     else:
                         # Multiple mixture components: map labels modulo mixture_k
@@ -582,17 +596,41 @@ class RESOLVAEModel(PyroModule):
             )
             
             # --- Add perturbation shift onto the true channel (ONLY through shift network) ---
+            print("perturbation_data is not None:", perturbation_data is not None)
+            
+            # Initialize delta and control_shifts
+            if z.ndim == 2:
+                delta = torch.zeros(z.shape[0], self.n_input, device=z.device)
+            else:
+                delta = torch.zeros(z.shape[0], z.shape[1], self.n_input, device=z.device)
+            
             if perturbation_data is not None:
                 px_rate_pre_shift = px_rate.clone()
-                u_k = self.perturb_emb(perturbation_data.long())                 # → (n_cells, D_s)
                 
-                # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
-                if z.ndim == 3 and u_k.ndim == 2:
-                    # z: [n_particles, n_cells, n_latent], u_k: [n_cells, embedding_dim]
-                    # Expand u_k to match z's dimensions
-                    u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)  # → [n_particles, n_cells, embedding_dim]
+                # Handle background cells (marked as -1) - exclude them from shift network
+                background_mask = (perturbation_data == -1)
+                perturbation_active_mask = ~background_mask
                 
-                delta = self.shift_scale * self.shift_net(torch.cat([z, u_k], dim=-1))  # Scale constrained output
+                if perturbation_active_mask.any():
+                    # Only process non-background cells through shift network
+                    active_perturbation_data = perturbation_data[perturbation_active_mask]
+                    active_z = z[perturbation_active_mask] if z.ndim == 2 else z[:, perturbation_active_mask, :]
+                    
+                    u_k = self.perturb_emb(active_perturbation_data.long())  # → (n_active_cells, D_s)
+                    
+                    # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
+                    if active_z.ndim == 3 and u_k.ndim == 2:
+                        # active_z: [n_particles, n_active_cells, n_latent], u_k: [n_active_cells, embedding_dim]
+                        # Expand u_k to match active_z's dimensions
+                        u_k = u_k.unsqueeze(0).expand(active_z.shape[0], -1, -1)  # → [n_particles, n_active_cells, embedding_dim]
+                    
+                    active_delta = self.shift_scale * self.shift_net(torch.cat([active_z, u_k], dim=-1))  # Scale constrained output
+                    
+                    # Create full delta tensor with zeros for background cells
+                    if z.ndim == 2:
+                        delta[perturbation_active_mask] = active_delta
+                    else:
+                        delta[:, perturbation_active_mask, :] = active_delta
                 
                 # Store control shift outputs for penalty calculation
                 control_mask = (perturbation_data == 0).float().unsqueeze(-1)  # 1 → control, 0 → perturbed
@@ -600,15 +638,40 @@ class RESOLVAEModel(PyroModule):
                     control_mask = control_mask.unsqueeze(0)
                 control_shifts = delta * control_mask  # Control shifts for penalty
                 
+                # Debug: Check what's happening with control shifts
+                print(f"Debug control penalty computation:")
+                print(f"  perturbation_data unique values: {torch.unique(perturbation_data)}")
+                print(f"  control_mask sum: {control_mask.sum().item()} (should be > 0 for control cells)")
+                print(f"  delta range: [{delta.min().item():.6f}, {delta.max().item():.6f}]")
+                print(f"  control_shifts range: [{control_shifts.min().item():.6f}, {control_shifts.max().item():.6f}]")
+                print(f"  control_shifts mean squared: {torch.mean(control_shifts ** 2).item():.6f}")
+                print(f"  control_penalty_weight: {self.control_penalty_weight}")
+                
                 # Apply shifts to ALL cells (no masking - let network learn everything)
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
                 # This ensures λ > 0 even with negative δ
                 log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
                 log_px_rate = log_px_rate_base + delta  # No masking - apply to all cells
                 px_rate = torch.exp(log_px_rate)
-                
-                # Store control shifts for loss computation
-                pyro.deterministic("control_shifts", control_shifts, event_dim=1)
+            else:
+                # No perturbation data - create zero control shifts
+                if z.ndim == 2:
+                    control_shifts = torch.zeros(z.shape[0], self.n_input, device=z.device)
+                else:
+                    control_shifts = torch.zeros(z.shape[0], z.shape[1], self.n_input, device=z.device)
+            
+            # Store control shifts for loss computation (always store, even if zero)
+            print("Storing control_shifts with shape:", control_shifts.shape)
+            # Use sample with Delta distribution and observe it to ensure it appears in trace
+            pyro.sample("control_shifts", Delta(control_shifts).to_event(1), obs=control_shifts)
+            
+            # Add control penalty as a deterministic node for ELBO computation
+            control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
+            print(f"Final control_penalty computation:")
+            print(f"  control_shifts mean squared: {torch.mean(control_shifts ** 2).item():.6f}")
+            print(f"  control_penalty_weight: {self.control_penalty_weight}")
+            print(f"  final control_penalty: {control_penalty.item():.6f}")
+            pyro.deterministic("control_penalty", control_penalty)
 
             if self.semisupervised:
                 probs_prediction_ = self.classifier(z)
@@ -1261,7 +1324,7 @@ class RESOLVAE(PyroBaseModuleClass):
         perturbation_hidden_dim: int = 64,
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
-        control_penalty_weight: float = 1.0,
+        control_penalty_weight: float = 10.0,
         latent_distribution: str | None = None,
     ):
         super().__init__()
