@@ -598,7 +598,7 @@ class RESOLVAEModel(PyroModule):
             # --- Add perturbation shift onto the true channel (ONLY through shift network) ---
             print("perturbation_data is not None:", perturbation_data is not None)
             
-            # Initialize delta and control_shifts
+            # Initialize delta (shifts) - all zeros by default
             if z.ndim == 2:
                 delta = torch.zeros(z.shape[0], self.n_input, device=z.device)
             else:
@@ -607,60 +607,63 @@ class RESOLVAEModel(PyroModule):
             if perturbation_data is not None:
                 px_rate_pre_shift = px_rate.clone()
                 
-                # Handle background cells (marked as -1) - exclude them from shift network
-                background_mask = (perturbation_data == -1)
-                perturbation_active_mask = ~background_mask
+                # Only process perturbed cells (not control, not background) through shift network
+                # Control cells: perturbation_data == 0 (skip shift network entirely)
+                # Background cells: perturbation_data == -1 (skip shift network entirely)
+                # Perturbed cells: perturbation_data > 0 (process through shift network)
+                perturbed_mask = (perturbation_data > 0)
                 
-                if perturbation_active_mask.any():
-                    # Only process non-background cells through shift network
-                    active_perturbation_data = perturbation_data[perturbation_active_mask]
-                    active_z = z[perturbation_active_mask] if z.ndim == 2 else z[:, perturbation_active_mask, :]
+                if perturbed_mask.any():
+                    # Only process perturbed cells through shift network
+                    perturbed_perturbation_data = perturbation_data[perturbed_mask]
+                    perturbed_z = z[perturbed_mask] if z.ndim == 2 else z[:, perturbed_mask, :]
                     
-                    u_k = self.perturb_emb(active_perturbation_data.long())  # → (n_active_cells, D_s)
+                    u_k = self.perturb_emb(perturbed_perturbation_data.long())  # → (n_perturbed_cells, D_s)
                     
                     # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
-                    if active_z.ndim == 3 and u_k.ndim == 2:
-                        # active_z: [n_particles, n_active_cells, n_latent], u_k: [n_active_cells, embedding_dim]
-                        # Expand u_k to match active_z's dimensions
-                        u_k = u_k.unsqueeze(0).expand(active_z.shape[0], -1, -1)  # → [n_particles, n_active_cells, embedding_dim]
+                    if perturbed_z.ndim == 3 and u_k.ndim == 2:
+                        # perturbed_z: [n_particles, n_perturbed_cells, n_latent], u_k: [n_perturbed_cells, embedding_dim]
+                        # Expand u_k to match perturbed_z's dimensions
+                        u_k = u_k.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
                     
-                    active_delta = self.shift_scale * self.shift_net(torch.cat([active_z, u_k], dim=-1))  # Scale constrained output
+                    perturbed_delta = self.shift_scale * self.shift_net(torch.cat([perturbed_z, u_k], dim=-1))  # Scale constrained output
                     
-                    # Create full delta tensor with zeros for background cells
+                    # Apply shifts only to perturbed cells, leave control and background cells unchanged
                     if z.ndim == 2:
-                        delta[perturbation_active_mask] = active_delta
+                        delta[perturbed_mask] = perturbed_delta
                     else:
-                        delta[:, perturbation_active_mask, :] = active_delta
+                        delta[:, perturbed_mask, :] = perturbed_delta
                 
-                # Store control shift outputs for penalty calculation
-                control_mask = (perturbation_data == 0).float().unsqueeze(-1)  # 1 → control, 0 → perturbed
-                if z.ndim == 3:  # particles dimension
-                    control_mask = control_mask.unsqueeze(0)
-                control_shifts = delta * control_mask  # Control shifts for penalty
-                
-                # Debug: Check what's happening with control shifts
-                print(f"Debug control penalty computation:")
+                # Debug: Check what's happening
+                control_mask = (perturbation_data == 0)
+                background_mask = (perturbation_data == -1)
+                print(f"Debug perturbation processing:")
                 print(f"  perturbation_data unique values: {torch.unique(perturbation_data)}")
-                print(f"  control_mask sum: {control_mask.sum().item()} (should be > 0 for control cells)")
+                print(f"  control cells: {control_mask.sum().item()}")
+                print(f"  background cells: {background_mask.sum().item()}")
+                print(f"  perturbed cells: {perturbed_mask.sum().item()}")
                 print(f"  delta range: [{delta.min().item():.6f}, {delta.max().item():.6f}]")
-                print(f"  control_shifts range: [{control_shifts.min().item():.6f}, {control_shifts.max().item():.6f}]")
-                print(f"  control_shifts mean squared: {torch.mean(control_shifts ** 2).item():.6f}")
-                print(f"  control_penalty_weight: {self.control_penalty_weight}")
+                print(f"  delta non-zero elements: {(delta != 0).sum().item()}")
                 
-                # Apply shifts to ALL cells (no masking - let network learn everything)
+                # Apply shifts to ALL cells (control cells get zero shifts, perturbed cells get computed shifts)
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
                 # This ensures λ > 0 even with negative δ
                 log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
-                log_px_rate = log_px_rate_base + delta  # No masking - apply to all cells
+                log_px_rate = log_px_rate_base + delta  # Apply shifts (zero for control/background, computed for perturbed)
                 px_rate = torch.exp(log_px_rate)
             else:
-                # No perturbation data - create zero control shifts
-                if z.ndim == 2:
-                    control_shifts = torch.zeros(z.shape[0], self.n_input, device=z.device)
-                else:
-                    control_shifts = torch.zeros(z.shape[0], z.shape[1], self.n_input, device=z.device)
+                # No perturbation data - delta remains all zeros
+                pass
             
-            # Store control shifts for loss computation (always store, even if zero)
+            # For control penalty, we want to penalize any non-zero shifts for control cells
+            # Since control cells should never have shifts, any non-zero shifts for them should be penalized
+            # But with the new logic, control cells will always have zero shifts by design
+            control_mask_for_penalty = (perturbation_data == 0).float().unsqueeze(-1) if perturbation_data is not None else torch.zeros(z.shape[0], 1, device=z.device)
+            if z.ndim == 3:  # particles dimension
+                control_mask_for_penalty = control_mask_for_penalty.unsqueeze(0)
+            control_shifts = delta * control_mask_for_penalty  # Should always be zero now
+            
+            # Store control shifts for loss computation (should be zero now)
             print("Storing control_shifts with shape:", control_shifts.shape)
             # Use sample with Delta distribution and observe it to ensure it appears in trace
             pyro.sample("control_shifts", Delta(control_shifts).to_event(1), obs=control_shifts)
