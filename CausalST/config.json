@@ -1,0 +1,33 @@
+{
+    "params": {
+      "scripts_folder": "/home/amonell/Desktop/spatial_perturb/CausalST/development_scripts",
+      "adata_path": "/mnt/sata1/Analysis_Alex/xenium_pilot/analysis/cleaned/final_celltyped_and_axes.h5ad",
+      "data_path": "/home/amonell/Desktop/spatial_perturb/CausalST/data",
+      "control_guide_index": 0,
+      "celltype_key": "Subtype",
+      "celltype_value": "Cd8_T-Cell_P14",
+      "spatial_key": "X_spatial",
+      "outputs": "/home/amonell/Desktop/spatial_perturb/CausalST/development_outputs",
+      
+      "intermediate_dim": 64,
+      "latent_dim": 10,
+      "beta": 1.2,
+      "epochs": 300,
+      "learning_rate": 0.001,
+      "additional_keys": ["crypt_villi_axis"],
+
+      "causal_epochs": 50,
+      "causal_lr": 0.001,
+      "causal_batch_size": 32,
+
+      "orthonormal_certificates_batch_size": 128,
+      "certs_k": 1000,
+      "certs_epochs": 20, 
+      "certs_reg": 0.01,
+      "certs_bias": "False",
+
+      "plot_CATEs": "True"
+    }
+}
+
+  

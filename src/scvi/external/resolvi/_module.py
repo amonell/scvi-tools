@@ -29,7 +29,54 @@ from scvi.module._classifier import Classifier
 from scvi.module.base import PyroBaseModuleClass, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder
 
+# CausalST spatial encoder imports
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../CausalST'))
+from CausalST.simplified_analysis.architectures.contrastiveVAE import VariationalEncoder
+from scipy.spatial import KDTree
+
 _RESOLVAE_PYRO_MODULE_NAME = "resolvae"
+
+
+def _compute_spatial_neighborhoods(
+    spatial_coords: np.ndarray, 
+    expression_data: np.ndarray, 
+    n_neighbors: int = 30
+) -> torch.Tensor:
+    """
+    Compute neighborhood-averaged gene expression for spatial encoding.
+    
+    Parameters
+    ----------
+    spatial_coords : np.ndarray
+        Spatial coordinates of shape (n_cells, 2)
+    expression_data : np.ndarray  
+        Gene expression data of shape (n_cells, n_genes)
+    n_neighbors : int
+        Number of spatial neighbors to average
+        
+    Returns
+    -------
+    torch.Tensor
+        Neighborhood-averaged expression of shape (n_cells, n_genes)
+    """
+    import scipy.stats as stats
+    
+    # Build spatial KD-tree for efficient neighbor search
+    tree = KDTree(spatial_coords)
+    
+    neighborhood_features = []
+    for i in range(len(spatial_coords)):
+        # Find k nearest neighbors
+        _, neighbors = tree.query(spatial_coords[i], k=n_neighbors)
+        
+        # Average expression across neighbors and z-score normalize
+        neighbor_expr = np.mean(expression_data[neighbors], axis=0)
+        normalized_expr = stats.zscore(neighbor_expr)
+        neighborhood_features.append(normalized_expr)
+    
+    return torch.from_numpy(np.array(neighborhood_features)).float()
 
 
 from pyro.infer import Trace_ELBO
@@ -231,6 +278,10 @@ class RESOLVAEModel(PyroModule):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
+        # Spatial encoder parameters
+        use_spatial_encoder: bool = True,
+        spatial_encoder_intermediate_dim: int = 64,
+        spatial_n_neighbors: int = 30,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -254,14 +305,34 @@ class RESOLVAEModel(PyroModule):
         self.perturbation_idx = perturbation_idx  # Index of perturbation in cat_covs
         self.control_penalty_weight = control_penalty_weight
         
+        # Store spatial encoder parameters
+        self.use_spatial_encoder = use_spatial_encoder
+        self.spatial_n_neighbors = spatial_n_neighbors
+        
         # Store key information for background handling
         self.background_key = None  # Will be set by setup_anndata
         self.perturbation_key = None  # Will be set by setup_anndata
         
-        # Perturbation embedding and shift network
+        # Perturbation embedding
         self.perturb_emb = torch.nn.Embedding(n_perturbs, perturbation_embed_dim)
+        
+        # CausalST spatial encoder (if enabled)
+        if self.use_spatial_encoder:
+            self.spatial_encoder = VariationalEncoder(
+                input_dim=n_input,
+                intermediate_dims=[spatial_encoder_intermediate_dim],
+                latent_dim=n_latent
+            )
+            # Spatial-aware shift network input: [z_expression, z_spatial, u_perturbation]
+            shift_input_dim = n_latent + n_latent + perturbation_embed_dim
+        else:
+            self.spatial_encoder = None
+            # Original shift network input: [z_expression, u_perturbation]
+            shift_input_dim = n_latent + perturbation_embed_dim
+            
+        # Shift network
         self.shift_net = torch.nn.Sequential(
-            torch.nn.Linear(n_latent + perturbation_embed_dim, perturbation_hidden_dim),
+            torch.nn.Linear(shift_input_dim, perturbation_hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(perturbation_hidden_dim, n_input),
             torch.nn.Tanh(),  # Bound outputs to [-1, 1]
@@ -618,6 +689,26 @@ class RESOLVAEModel(PyroModule):
                     perturbed_perturbation_data = perturbation_data[perturbed_mask]
                     perturbed_z = z[perturbed_mask] if z.ndim == 2 else z[:, perturbed_mask, :]
                     
+                    # Compute spatial embeddings if spatial encoder is enabled
+                    if self.use_spatial_encoder and self.spatial_encoder is not None:
+                        # Use neighborhood-averaged expression (x_n) for spatial encoding
+                        perturbed_x_n = x_n[perturbed_mask] if x_n.ndim == 2 else x_n[:, perturbed_mask, :]
+                        
+                        # Get spatial embeddings from CausalST encoder (mean only, ignore variance)
+                        spatial_mean, spatial_logvar = self.spatial_encoder(perturbed_x_n)
+                        perturbed_z_spatial = spatial_mean  # Use mean as spatial embedding
+                        
+                        # Handle dimension mismatch for spatial embeddings
+                        if perturbed_z.ndim == 3 and perturbed_z_spatial.ndim == 2:
+                            perturbed_z_spatial = perturbed_z_spatial.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)
+                    else:
+                        # No spatial encoder - create zero spatial embeddings
+                        spatial_dim = perturbed_z.shape[-1]  # Same dimension as expression latent
+                        if perturbed_z.ndim == 3:
+                            perturbed_z_spatial = torch.zeros(perturbed_z.shape[0], perturbed_z.shape[1], spatial_dim, device=perturbed_z.device)
+                        else:
+                            perturbed_z_spatial = torch.zeros(perturbed_z.shape[0], spatial_dim, device=perturbed_z.device)
+                    
                     u_k = self.perturb_emb(perturbed_perturbation_data.long())  # → (n_perturbed_cells, D_s)
                     
                     # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
@@ -626,7 +717,13 @@ class RESOLVAEModel(PyroModule):
                         # Expand u_k to match perturbed_z's dimensions
                         u_k = u_k.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
                     
-                    perturbed_delta = self.shift_scale * self.shift_net(torch.cat([perturbed_z, u_k], dim=-1))  # Scale constrained output
+                    # Concatenate expression, spatial, and perturbation embeddings for shift network
+                    if self.use_spatial_encoder:
+                        shift_input = torch.cat([perturbed_z, perturbed_z_spatial, u_k], dim=-1)
+                    else:
+                        shift_input = torch.cat([perturbed_z, u_k], dim=-1)  # Original behavior
+                    
+                    perturbed_delta = self.shift_scale * self.shift_net(shift_input)  # Scale constrained output
                     
                     # Apply shifts only to perturbed cells, leave control and background cells unchanged
                     if z.ndim == 2:
@@ -1329,6 +1426,10 @@ class RESOLVAE(PyroBaseModuleClass):
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
         latent_distribution: str | None = None,
+        # Spatial encoder parameters
+        use_spatial_encoder: bool = True,
+        spatial_encoder_intermediate_dim: int = 64,
+        spatial_n_neighbors: int = 30,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -1418,6 +1519,10 @@ class RESOLVAE(PyroBaseModuleClass):
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
+            # Spatial encoder parameters
+            use_spatial_encoder=use_spatial_encoder,
+            spatial_encoder_intermediate_dim=spatial_encoder_intermediate_dim,
+            spatial_n_neighbors=spatial_n_neighbors,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 

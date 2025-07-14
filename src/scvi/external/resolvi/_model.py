@@ -187,6 +187,10 @@ class RESOLVI(
         perturbation_hidden_dim: int = 64,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 1.0,
+        # Spatial encoder parameters
+        use_spatial_encoder: bool = True,
+        spatial_encoder_intermediate_dim: int = 64,
+        spatial_n_neighbors: int = 30,
         **model_kwargs,
     ):
         pyro.clear_param_store()
@@ -268,6 +272,10 @@ class RESOLVI(
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
+            # Spatial encoder parameters
+            use_spatial_encoder=use_spatial_encoder,
+            spatial_encoder_intermediate_dim=spatial_encoder_intermediate_dim,
+            spatial_n_neighbors=spatial_n_neighbors,
             **model_kwargs,
         )
         
