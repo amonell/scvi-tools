@@ -1,7 +1,7 @@
 """Main module."""
 
 from collections.abc import Callable, Iterable
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 import pyro
@@ -28,6 +28,8 @@ from scvi.dataloaders import AnnTorchDataset
 from scvi.module._classifier import Classifier
 from scvi.module.base import PyroBaseModuleClass, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder
+
+from ._spatial_encoder import SpatialEncoder
 
 _RESOLVAE_PYRO_MODULE_NAME = "resolvae"
 
@@ -231,6 +233,8 @@ class RESOLVAEModel(PyroModule):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
+        spatial_encoder: Optional[SpatialEncoder] = None,
+        n_input_spatial: int = 2,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -261,7 +265,7 @@ class RESOLVAEModel(PyroModule):
         # Perturbation embedding and shift network
         self.perturb_emb = torch.nn.Embedding(n_perturbs, perturbation_embed_dim)
         self.shift_net = torch.nn.Sequential(
-            torch.nn.Linear(n_latent + perturbation_embed_dim, perturbation_hidden_dim),
+            torch.nn.Linear(2 * n_latent + perturbation_embed_dim, perturbation_hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(perturbation_hidden_dim, n_input),
             torch.nn.Tanh(),  # Bound outputs to [-1, 1]
@@ -345,61 +349,29 @@ class RESOLVAEModel(PyroModule):
                 **cls_parameters,
             )
 
+        # Initialize spatial encoder
+        self.spatial_encoder = spatial_encoder or SpatialEncoder(
+            n_input_spatial=n_input_spatial,
+            n_latent=n_latent,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            use_batch_norm=use_batch_norm == "encoder" or use_batch_norm == "both",
+            use_layer_norm=use_layer_norm == "encoder" or use_layer_norm == "both",
+        )
+
     def _get_fn_args_from_batch(self, tensor_dict: dict[str, torch.Tensor]) -> Iterable | dict:
         x = tensor_dict[REGISTRY_KEYS.X_KEY]
-        y = tensor_dict[REGISTRY_KEYS.LABELS_KEY].long().ravel()
-        batch_index = tensor_dict[REGISTRY_KEYS.BATCH_KEY]
+        ind_x = tensor_dict.get(REGISTRY_KEYS.INDICES_KEY)
+        library = tensor_dict.get(REGISTRY_KEYS.LIBRARY_KEY)
+        y = tensor_dict.get(REGISTRY_KEYS.LABELS_KEY)
+        batch_index = tensor_dict.get(REGISTRY_KEYS.BATCH_KEY)
+        cat_covs = tensor_dict.get(REGISTRY_KEYS.CAT_COVS_KEY)
+        perturbation_data = tensor_dict.get(REGISTRY_KEYS.PERTURBATION_KEY)
+        x_n = tensor_dict.get("x_n")
+        distances_n = tensor_dict.get("distances_n")
+        spatial_coords = tensor_dict.get(REGISTRY_KEYS.SPATIAL_KEY)  # Get spatial coordinates
 
-        cat_key = REGISTRY_KEYS.CAT_COVS_KEY
-        cat_covs = tensor_dict[cat_key] if cat_key in tensor_dict.keys() else None
-
-        # Extract perturbation data separately (not from cat_covs)
-        perturbation_data = tensor_dict.get("perturbation", None)
-        if perturbation_data is not None:
-            perturbation_data = perturbation_data.long().ravel()
-            
-            # Handle the case where background_key is the same as perturbation_key
-            # In this case, the background category (index 1) should be excluded from perturbation logic
-            # We need to remap the perturbation codes to exclude background
-            if hasattr(self, 'background_key') and hasattr(self, 'perturbation_key'):
-                if self.background_key == self.perturbation_key:
-                    # Create a mapping that excludes background (index 1)
-                    # Original: [control=0, background=1, perturb1=2, perturb2=3, ...]
-                    # New: [control=0, perturb1=1, perturb2=2, ...] (background becomes -1 or special value)
-                    background_mask = (perturbation_data == 1)  # Background is at index 1
-                    
-                    # For background cells, set perturbation to a special value (-1) to exclude from shift network
-                    # For non-background cells, remap: 0->0 (control), 2->1, 3->2, etc.
-                    remapped_perturbation = perturbation_data.clone()
-                    remapped_perturbation[background_mask] = -1  # Mark background cells
-                    
-                    # Remap non-background, non-control cells
-                    non_background_mask = ~background_mask & (perturbation_data > 1)
-                    if non_background_mask.any():
-                        remapped_perturbation[non_background_mask] = perturbation_data[non_background_mask] - 1
-                    
-                    perturbation_data = remapped_perturbation
-        else:
-            # If no perturbation data, treat all cells as control (index 0)
-            perturbation_data = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-
-        ind_x = tensor_dict[REGISTRY_KEYS.INDICES_KEY].long().ravel()
-        distances_n = tensor_dict["distance_neighbor"]
-        ind_neighbors = tensor_dict["index_neighbor"].long()
-
-        x_n = self.expression_anntorchdata[ind_neighbors.cpu().numpy().flatten(), :]["X"]
-        if isinstance(x_n, np.ndarray):
-            x_n = torch.from_numpy(x_n)
-        x_n = x_n.to(x.device)
-
-        if x.layout is torch.sparse_csr or x.layout is torch.sparse_csc:
-            x = x.to_dense()
-        if x_n.layout is torch.sparse_csr or x_n.layout is torch.sparse_csc:
-            x_n = x_n.to_dense()
-        x_n = x_n.reshape(x.shape[0], -1)
-        library = torch.log(torch.sum(x, dim=1, keepdim=True))
-
-        return (), {
+        input_dict = {
             "x": x,
             "ind_x": ind_x,
             "library": library,
@@ -409,7 +381,9 @@ class RESOLVAEModel(PyroModule):
             "perturbation_data": perturbation_data,
             "x_n": x_n,
             "distances_n": distances_n,
+            "spatial_coords": spatial_coords,  # Add spatial coordinates to input dict
         }
+        return (), input_dict
 
     @auto_move_data
     def model_unconditioned(
@@ -423,6 +397,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_coords: torch.Tensor,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -596,7 +571,6 @@ class RESOLVAEModel(PyroModule):
             )
             
             # --- Add perturbation shift onto the true channel (ONLY through shift network) ---
-            print("perturbation_data is not None:", perturbation_data is not None)
             
             # Initialize delta (shifts) - all zeros by default
             if z.ndim == 2:
@@ -618,15 +592,41 @@ class RESOLVAEModel(PyroModule):
                     perturbed_perturbation_data = perturbation_data[perturbed_mask]
                     perturbed_z = z[perturbed_mask] if z.ndim == 2 else z[:, perturbed_mask, :]
                     
+                    # Get spatial latent for perturbed cells
+                    if spatial_coords is not None:
+                        perturbed_spatial_coords = spatial_coords[perturbed_mask] if spatial_coords.ndim == 2 else spatial_coords[:, perturbed_mask, :]
+                        perturbed_batch_index = batch_index[perturbed_mask] if batch_index.ndim == 1 else batch_index[:, perturbed_mask]
+                        
+                        # Get spatial latent representation
+                        _, _, z_spatial_perturbed = self.spatial_encoder(perturbed_spatial_coords, perturbed_batch_index)
+                        
+                        # Concatenate gene expression latent with spatial latent
+                        if perturbed_z.ndim == 3 and z_spatial_perturbed.ndim == 2:
+                            # Handle particle dimension: expand spatial latent to match
+                            z_spatial_perturbed = z_spatial_perturbed.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)
+                        elif perturbed_z.ndim == 2 and z_spatial_perturbed.ndim == 3:
+                            # Handle case where spatial has particle dimension but gene doesn't
+                            z_spatial_perturbed = z_spatial_perturbed.squeeze(0)
+                            
+                        perturbed_z_combined = torch.cat([perturbed_z, z_spatial_perturbed], dim=-1)
+                    else:
+                        # No spatial coordinates available - use zero padding to maintain dimensions
+                        if perturbed_z.ndim == 3:
+                            zero_spatial = torch.zeros(perturbed_z.shape[0], perturbed_z.shape[1], self.n_latent, device=perturbed_z.device)
+                        else:
+                            zero_spatial = torch.zeros(perturbed_z.shape[0], self.n_latent, device=perturbed_z.device)
+                        perturbed_z_combined = torch.cat([perturbed_z, zero_spatial], dim=-1)
+                    
                     u_k = self.perturb_emb(perturbed_perturbation_data.long())  # → (n_perturbed_cells, D_s)
                     
                     # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
-                    if perturbed_z.ndim == 3 and u_k.ndim == 2:
-                        # perturbed_z: [n_particles, n_perturbed_cells, n_latent], u_k: [n_perturbed_cells, embedding_dim]
-                        # Expand u_k to match perturbed_z's dimensions
-                        u_k = u_k.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
+                    if perturbed_z_combined.ndim == 3 and u_k.ndim == 2:
+                        # perturbed_z_combined: [n_particles, n_perturbed_cells, 2*n_latent], u_k: [n_perturbed_cells, embedding_dim]
+                        # Expand u_k to match perturbed_z_combined's dimensions
+                        u_k = u_k.unsqueeze(0).expand(perturbed_z_combined.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
                     
-                    perturbed_delta = self.shift_scale * self.shift_net(torch.cat([perturbed_z, u_k], dim=-1))  # Scale constrained output
+                    # Use combined latent (gene + spatial) in shift network
+                    perturbed_delta = self.shift_scale * self.shift_net(torch.cat([perturbed_z_combined, u_k], dim=-1))  # Scale constrained output
                     
                     # Apply shifts only to perturbed cells, leave control and background cells unchanged
                     if z.ndim == 2:
@@ -634,16 +634,7 @@ class RESOLVAEModel(PyroModule):
                     else:
                         delta[:, perturbed_mask, :] = perturbed_delta
                 
-                # Debug: Check what's happening
-                control_mask = (perturbation_data == 0)
-                background_mask = (perturbation_data == -1)
-                print(f"Debug perturbation processing:")
-                print(f"  perturbation_data unique values: {torch.unique(perturbation_data)}")
-                print(f"  control cells: {control_mask.sum().item()}")
-                print(f"  background cells: {background_mask.sum().item()}")
-                print(f"  perturbed cells: {perturbed_mask.sum().item()}")
-                print(f"  delta range: [{delta.min().item():.6f}, {delta.max().item():.6f}]")
-                print(f"  delta non-zero elements: {(delta != 0).sum().item()}")
+
                 
                 # Apply shifts to ALL cells (control cells get zero shifts, perturbed cells get computed shifts)
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
@@ -664,16 +655,11 @@ class RESOLVAEModel(PyroModule):
             control_shifts = delta * control_mask_for_penalty  # Should always be zero now
             
             # Store control shifts for loss computation (should be zero now)
-            print("Storing control_shifts with shape:", control_shifts.shape)
             # Use sample with Delta distribution and observe it to ensure it appears in trace
             pyro.sample("control_shifts", Delta(control_shifts).to_event(1), obs=control_shifts)
             
             # Add control penalty as a deterministic node for ELBO computation
             control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
-            print(f"Final control_penalty computation:")
-            print(f"  control_shifts mean squared: {torch.mean(control_shifts ** 2).item():.6f}")
-            print(f"  control_penalty_weight: {self.control_penalty_weight}")
-            print(f"  final control_penalty: {control_penalty.item():.6f}")
             pyro.deterministic("control_penalty", control_penalty)
 
             if self.semisupervised:
@@ -802,13 +788,15 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_coords: torch.Tensor,  # New parameter for spatial coordinates
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
         """Forward pass."""
-        # Using condition handle for training, this is the reconstruction loss.
+        # Pass spatial_coords directly to model_unconditioned where spatial processing happens
+        # The spatial encoder will be called within model_unconditioned where it's actually used
         pyro.condition(self.model_unconditioned, data={"obs": x})(
-            x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight
+            x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, spatial_coords, n_obs, kl_weight
         )
 
     @auto_move_data
@@ -823,6 +811,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_coords: torch.Tensor,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -833,7 +822,7 @@ class RESOLVAEModel(PyroModule):
                 "diffusion_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
                 "true_mixture_proportion": torch.ones(x.shape[0], device=x.device),
             },
-        )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight)
+        )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, spatial_coords, n_obs, kl_weight)
 
     @auto_move_data
     def model_residuals(
@@ -847,6 +836,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_coords: torch.Tensor,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -855,7 +845,7 @@ class RESOLVAEModel(PyroModule):
             data={
                 "true_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
             },
-        )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight)
+        )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, spatial_coords, n_obs, kl_weight)
 
     @auto_move_data
     def model_simplified(
@@ -869,6 +859,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_coords: torch.Tensor,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
         corrected_rate: bool = False,
@@ -901,10 +892,10 @@ class RESOLVAEModel(PyroModule):
                         "diffusion_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
                         "true_mixture_proportion": torch.ones(x.shape[0], device=x.device),
                     },
-                )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight)
+                )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, spatial_coords, n_obs, kl_weight)
             else:
                 simplified_model(
-                    x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight
+                    x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, spatial_coords, n_obs, kl_weight
                 )
 
 
@@ -1043,6 +1034,7 @@ class RESOLVAEGuide(PyroModule):
         perturbation_data,
         x_n,
         distances_n,
+        spatial_coords,
         n_obs=None,
         kl_weight=1.0,
     ):
@@ -1173,6 +1165,7 @@ class RESOLVAEGuide(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_coords: torch.Tensor,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -1194,7 +1187,7 @@ class RESOLVAEGuide(PyroModule):
 
         with pyro.poutine.scale(scale=x.shape[0] / self.n_obs):
             simplified_guide(
-                x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight
+                x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, spatial_coords, n_obs, kl_weight
             )
 
 
@@ -1328,6 +1321,8 @@ class RESOLVAE(PyroBaseModuleClass):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
+        spatial_encoder: Optional[SpatialEncoder] = None,
+        n_input_spatial: int = 2,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1418,6 +1413,8 @@ class RESOLVAE(PyroBaseModuleClass):
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
+            spatial_encoder=spatial_encoder,
+            n_input_spatial=n_input_spatial,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 

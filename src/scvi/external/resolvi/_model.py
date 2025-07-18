@@ -187,6 +187,7 @@ class RESOLVI(
         perturbation_hidden_dim: int = 64,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 1.0,
+        n_input_spatial: int = 2,  # New parameter for spatial input dimension
         **model_kwargs,
     ):
         pyro.clear_param_store()
@@ -241,15 +242,11 @@ class RESOLVI(
             getitem_tensors=["X"],
             load_sparse_tensor=True,
         )
-        self.module = self._module_cls(
+        # Initialize the module with spatial encoder
+        self.module = RESOLVAE(
             n_input=self.summary_stats.n_vars,
+            n_obs=self.summary_stats.n_cells,
             n_batch=self.summary_stats.n_batch,
-            n_cats_per_cov=n_cats_per_cov,
-            n_labels=n_labels,
-            mixture_k=mixture_k,
-            expression_anntorchdata=expression_anntorchdata,
-            n_neighbors=self.summary_stats.n_distance_neighbor,
-            n_obs=self.summary_stats["n_ind_x"],
             n_hidden=n_hidden,
             n_hidden_encoder=n_hidden_encoder,
             n_latent=n_latent,
@@ -257,17 +254,14 @@ class RESOLVI(
             dropout_rate=dropout_rate,
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
-            background_ratio=background_ratio,
-            median_distance=median_distance,
-            semisupervised=semisupervised,
-            downsample_counts_mean=downsample_counts_mean,
-            downsample_counts_std=downsample_counts_std,
-            n_perturbs=n_perturbs,
+            mixture_k=mixture_k,
+            n_labels=self.summary_stats.n_labels,
+            n_cats_per_cov=self.summary_stats.n_cats_per_cov,
             perturbation_embed_dim=perturbation_embed_dim,
             perturbation_hidden_dim=perturbation_hidden_dim,
-            perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
+            n_input_spatial=n_input_spatial,  # Pass spatial input dimension
             **model_kwargs,
         )
         
@@ -277,12 +271,7 @@ class RESOLVI(
         setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
         self.module.model.background_key = setup_args.get('background_key')
         self.module.model.perturbation_key = setup_args.get('perturbation_key')
-        self._model_summary_string = (
-            f"RESOLVI Model with the following params: \nn_hidden: {n_hidden} "
-            f"n_latent: {n_latent}, n_layers: {n_layers}, dropout_rate: "
-            f"{dropout_rate}, dispersion: {dispersion}, gene_likelihood: {gene_likelihood} "
-            f"n_neighbors: {self.summary_stats.n_distance_neighbor}"
-        )
+        self._model_summary_string = "ResolVI Model with spatial information"
         self.init_params_ = self._get_init_params(locals())
 
     def train(
@@ -651,43 +640,20 @@ class RESOLVI(
         control_perturbation: str | None = None,
         background_key: str | None = None,
         background_category: str | None = None,
+        spatial_key: str = "spatial",  # New parameter for spatial coordinates
         prepare_data: bool | None = True,
         prepare_data_kwargs: dict = None,
         unlabeled_category: str = "unknown",
         **kwargs,
     ):
-        """%(summary)s.
+        """
+        %(setup_anndata.full_desc)s
 
         Parameters
         ----------
-        %(param_adata)s
-        %(param_layer)s
-        %(param_batch_key)s
-        %(param_labels_key)s
-        %(param_cat_cov_keys)s
-        perturbation_key
-            Key in adata.obs for perturbation categories (e.g., knockout conditions).
-            Perturbations will be handled separately from other categorical covariates
-            and will only affect gene expression through the shift network.
-        control_perturbation
-            Value in perturbation_key column that represents the control condition.
-            If None, the first category alphabetically will be used as control.
-        background_key
-            Key in adata.obs for background cell categories. Background cells are those
-            that should not be used for perturbation training (neither control nor perturbed).
-            When train_on_perturbed_only=True, only control and perturbed cells will be used
-            for training, while background cells will be excluded from training but still
-            used for neighbor and background computations. Can be the same as perturbation_key
-            if different categories within the same column represent different cell roles.
-        background_category
-            Value in background_key column that represents background cells.
-            If None and background_key is provided, the first category will be used.
-            Should be different from control_perturbation if using the same key.
-        prepare_data
-            If True, prepares AnnData for training. Computes spatial neighbors and distances.
-        prepare_data_kwargs
-            Keyword args for :meth:`scvi.external.RESOLVI._prepare_data`
-        %(param_unlabeled_category)s
+        %(setup_anndata.parameters)s
+        spatial_key
+            Key in adata.obsm where spatial coordinates are stored
         """
         setup_method_args = cls._get_setup_method_args(**locals())
         if layer is None:
@@ -802,6 +768,8 @@ class RESOLVI(
             CategoricalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
             label_field,
             CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
+            CategoricalObsField(REGISTRY_KEYS.PERTURBATION_KEY, perturbation_key),
+            ObsmField(REGISTRY_KEYS.SPATIAL_KEY, spatial_key),  # New field for spatial data
         ]
         
         # Add perturbation field separately if it exists

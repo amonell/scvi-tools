@@ -2139,7 +2139,24 @@ class ResolVIPredictiveMixin:
                         if z.ndim == 3 and u_k.ndim == 2:
                             u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
                         
-                        delta = self.module.model.shift_scale * self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
+                        # Get spatial latent if available and combine with gene expression latent
+                        if kwargs["spatial_coords"] is not None:
+                            _, _, z_spatial = self.module.model.spatial_encoder(
+                                kwargs["spatial_coords"], kwargs["batch_index"]
+                            )
+                            # Handle dimension matching for particle-based sampling
+                            if z.ndim == 3 and z_spatial.ndim == 2:
+                                z_spatial = z_spatial.unsqueeze(0).expand(z.shape[0], -1, -1)
+                            z_combined = torch.cat([z, z_spatial], dim=-1)
+                        else:
+                            # No spatial coordinates - use zero padding to maintain dimensions
+                            if z.ndim == 3:
+                                zero_spatial = torch.zeros(z.shape[0], z.shape[1], self.module.model.n_latent, device=z.device)
+                            else:
+                                zero_spatial = torch.zeros(z.shape[0], self.module.model.n_latent, device=z.device)
+                            z_combined = torch.cat([z, zero_spatial], dim=-1)
+                        
+                        delta = self.module.model.shift_scale * self.module.model.shift_net(torch.cat([z_combined, u_k], dim=-1))
                         
                         # Apply shifts only to perturbed cells
                         mask = perturbed_mask.float().unsqueeze(-1)
@@ -2264,8 +2281,22 @@ class ResolVIPredictiveMixin:
                     
                     u_k = self.module.model.perturb_emb(perturbed_perturb_idx)
                     
+                    # Get spatial latent for perturbed cells if available
+                    if kwargs["spatial_coords"] is not None:
+                        perturbed_spatial_coords = kwargs["spatial_coords"][perturbed_mask]
+                        perturbed_batch_index = kwargs["batch_index"][perturbed_mask]
+                        
+                        _, _, z_spatial_perturbed = self.module.model.spatial_encoder(
+                            perturbed_spatial_coords, perturbed_batch_index
+                        )
+                        perturbed_z_combined = torch.cat([perturbed_z, z_spatial_perturbed], dim=-1)
+                    else:
+                        # No spatial coordinates - use zero padding to maintain dimensions
+                        zero_spatial = torch.zeros(perturbed_z.shape[0], self.module.model.n_latent, device=perturbed_z.device)
+                        perturbed_z_combined = torch.cat([perturbed_z, zero_spatial], dim=-1)
+                    
                     # Get raw shift network outputs (before scaling)
-                    raw_delta = self.module.model.shift_net(torch.cat([perturbed_z, u_k], dim=-1))
+                    raw_delta = self.module.model.shift_net(torch.cat([perturbed_z_combined, u_k], dim=-1))
                     # Apply scaling to match what's used in the model
                     perturbed_scaled_delta = self.module.model.shift_scale * raw_delta
                     
@@ -2462,8 +2493,20 @@ class ResolVIPredictiveMixin:
                         (batch_size_actual,), perturb_idx, device=device, dtype=torch.long
                     )
                     u_k = self.module.model.perturb_emb(perturb_tensor)
+                    
+                    # Get spatial latent if available and combine with gene expression latent
+                    if kwargs["spatial_coords"] is not None:
+                        _, _, z_spatial = self.module.model.spatial_encoder(
+                            kwargs["spatial_coords"], kwargs["batch_index"]
+                        )
+                        z_combined = torch.cat([z_sample, z_spatial], dim=-1)
+                    else:
+                        # No spatial coordinates - use zero padding to maintain dimensions
+                        zero_spatial = torch.zeros(z_sample.shape[0], self.module.model.n_latent, device=z_sample.device)
+                        z_combined = torch.cat([z_sample, zero_spatial], dim=-1)
+                    
                     delta = self.module.model.shift_scale * self.module.model.shift_net(
-                        torch.cat([z_sample, u_k], dim=-1)
+                        torch.cat([z_combined, u_k], dim=-1)
                     )
                     
                     # Apply shift to get perturbed px_rate
