@@ -16,6 +16,12 @@ class _REGISTRY_KEYS_NT(NamedTuple):
     LATENT_QZM_KEY: str = "latent_qzm"
     LATENT_QZV_KEY: str = "latent_qzv"
     OBSERVED_LIB_SIZE: str = "observed_lib_size"
+    SPATIAL_KEY: str = "spatial"
+    PERTURBATION_KEY: str = "perturbation"
+    CONTROL_PERTURBATION_KEY: str = "control_perturbation"
+    BACKGROUND_KEY: str = "background"
+    BACKGROUND_CATEGORY_KEY: str = "background_category"
+    LIBRARY_KEY: str = "library"
 
 
 REGISTRY_KEYS = _REGISTRY_KEYS_NT()

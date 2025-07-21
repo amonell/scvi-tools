@@ -237,15 +237,29 @@ class RESOLVI(
             downsample_counts_mean = None
             downsample_counts_std = 1.0
 
+        # expression_anntorchdata = AnnTorchDataset(
+        #     self.adata_manager,
+        #     getitem_tensors=["X"],
+        #     load_sparse_tensor=True,
+        # )
+
         expression_anntorchdata = AnnTorchDataset(
             self.adata_manager,
-            getitem_tensors=["X"],
+            getitem_tensors= [
+                REGISTRY_KEYS.X_KEY,
+                "index_neighbor",
+                "distance_neighbor",
+                REGISTRY_KEYS.SPATIAL_KEY,
+            ],
             load_sparse_tensor=True,
         )
+
         # Initialize the module with spatial encoder
         self.module = RESOLVAE(
             n_input=self.summary_stats.n_vars,
             n_obs=self.summary_stats.n_cells,
+            n_neighbors=10,
+            expression_anntorchdata=expression_anntorchdata,
             n_batch=self.summary_stats.n_batch,
             n_hidden=n_hidden,
             n_hidden_encoder=n_hidden_encoder,
@@ -256,7 +270,8 @@ class RESOLVI(
             gene_likelihood=gene_likelihood,
             mixture_k=mixture_k,
             n_labels=self.summary_stats.n_labels,
-            n_cats_per_cov=self.summary_stats.n_cats_per_cov,
+            #n_cats_per_cov=self.summary_stats.n_cats_per_cov,
+            n_cats_per_cov=n_cats_per_cov,
             perturbation_embed_dim=perturbation_embed_dim,
             perturbation_hidden_dim=perturbation_hidden_dim,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
