@@ -77,7 +77,7 @@ class ControlPenaltyELBO(Trace_ELBO):
         
         return total_loss
 
-def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-8) -> torch.Tensor:
+def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-12) -> torch.Tensor:
     """
     Safely compute log1p(x / mean(x)) with numerical stability checks.
     
@@ -267,7 +267,7 @@ class RESOLVAEModel(PyroModule):
             torch.nn.Tanh(),  # Bound outputs to [-1, 1]
         )
         # Scale factor for shift network output (bounds shifts to reasonable range)
-        self.shift_scale = 2.0  # Max shift magnitude in log space
+        self.shift_scale = 4.0  # Max shift magnitude in log space
 
         if self.dispersion == "gene":
             init_px_r = torch.full([n_input], 0.01)
@@ -594,10 +594,7 @@ class RESOLVAEModel(PyroModule):
                 batch_index,
                 *categorical_input,
             )
-            
-            # --- Add perturbation shift onto the true channel (ONLY through shift network) ---
-            print("perturbation_data is not None:", perturbation_data is not None)
-            
+
             # Initialize delta (shifts) - all zeros by default
             if z.ndim == 2:
                 delta = torch.zeros(z.shape[0], self.n_input, device=z.device)
@@ -637,18 +634,11 @@ class RESOLVAEModel(PyroModule):
                 # Debug: Check what's happening
                 control_mask = (perturbation_data == 0)
                 background_mask = (perturbation_data == -1)
-                print(f"Debug perturbation processing:")
-                print(f"  perturbation_data unique values: {torch.unique(perturbation_data)}")
-                print(f"  control cells: {control_mask.sum().item()}")
-                print(f"  background cells: {background_mask.sum().item()}")
-                print(f"  perturbed cells: {perturbed_mask.sum().item()}")
-                print(f"  delta range: [{delta.min().item():.6f}, {delta.max().item():.6f}]")
-                print(f"  delta non-zero elements: {(delta != 0).sum().item()}")
                 
                 # Apply shifts to ALL cells (control cells get zero shifts, perturbed cells get computed shifts)
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
                 # This ensures λ > 0 even with negative δ
-                log_px_rate_base = torch.log(px_rate + 1e-8)  # Add small epsilon to avoid log(0)
+                log_px_rate_base = torch.log(px_rate + 1e-12)  # Add small epsilon to avoid log(0)
                 log_px_rate = log_px_rate_base + delta  # Apply shifts (zero for control/background, computed for perturbed)
                 px_rate = torch.exp(log_px_rate)
             else:
@@ -663,17 +653,12 @@ class RESOLVAEModel(PyroModule):
                 control_mask_for_penalty = control_mask_for_penalty.unsqueeze(0)
             control_shifts = delta * control_mask_for_penalty  # Should always be zero now
             
-            # Store control shifts for loss computation (should be zero now)
-            print("Storing control_shifts with shape:", control_shifts.shape)
             # Use sample with Delta distribution and observe it to ensure it appears in trace
             pyro.sample("control_shifts", Delta(control_shifts).to_event(1), obs=control_shifts)
             
             # Add control penalty as a deterministic node for ELBO computation
             control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
-            print(f"Final control_penalty computation:")
-            print(f"  control_shifts mean squared: {torch.mean(control_shifts ** 2).item():.6f}")
-            print(f"  control_penalty_weight: {self.control_penalty_weight}")
-            print(f"  final control_penalty: {control_penalty.item():.6f}")
+
             pyro.deterministic("control_penalty", control_penalty)
 
             if self.semisupervised:

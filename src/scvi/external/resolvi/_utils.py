@@ -16,7 +16,7 @@ from scvi.utils import track
 logger = logging.getLogger(__name__)
 
 
-def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-8) -> torch.Tensor:
+def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-12) -> torch.Tensor:
     """
     Safely compute log1p(x / mean(x)) with numerical stability checks.
     
@@ -784,7 +784,7 @@ class ResolVIPredictiveMixin:
             perturb_counts = torch.cat([batch[perturb_idx] for batch in all_counterfactual_counts], dim=1)  # [n_samples, total_cells, n_genes]
             
             # Compute log fold change on actual counts
-            eps = 1e-8
+            eps = 1e-12
             control_safe = torch.clamp(control_counts, min=eps)
             perturb_safe = torch.clamp(perturb_counts, min=eps)
             
@@ -1305,7 +1305,7 @@ class ResolVIPredictiveMixin:
             perturb_counts = torch.cat([batch[perturb_idx] for batch in all_counterfactual_counts], dim=1)
             
             # Compute log fold change per cell per sample
-            eps = 1e-8
+            eps = 1e-12
             control_safe = torch.clamp(control_counts, min=eps)
             perturb_safe = torch.clamp(perturb_counts, min=eps)
             
@@ -1809,7 +1809,7 @@ class ResolVIPredictiveMixin:
                     perturb_counts = perturb_counts.squeeze(0)  # [batch_size, n_genes]
                     
                     # Compute log fold changes
-                    eps = 1e-8
+                    eps = 1e-12
                     control_safe = torch.clamp(control_counts, min=eps)
                     perturb_safe = torch.clamp(perturb_counts, min=eps)
                     
@@ -1946,9 +1946,12 @@ class ResolVIPredictiveMixin:
                     kwargs["perturbation_data"] = torch.zeros_like(
                         kwargs["perturbation_data"], device=device, dtype=torch.long
                     )
-
-                if kwargs["cat_covs"] is not None and self.module.encode_covariates:
-                    categorical_input = list(torch.split(kwargs["cat_covs"], 1, dim=1))
+                # zero only the perturbation‐covariate column, leave all other cat_covs intact
+                if kwargs["cat_covs"] is not None and self.module.model.perturbation_idx is not None:
+                    cat_covs = kwargs["cat_covs"].clone()
+                    pidx = self.module.model.perturbation_idx
+                    cat_covs[:, pidx] = 0
+                    categorical_input = list(torch.split(cat_covs, 1, dim=1))
                 else:
                     categorical_input = ()
 
@@ -2146,7 +2149,7 @@ class ResolVIPredictiveMixin:
                         if z.ndim == 3:
                             mask = mask.unsqueeze(0)
                         
-                        log_px_rate_base = torch.log(px_rate + 1e-8)
+                        log_px_rate_base = torch.log(px_rate + 1e-12)
                         log_px_rate = log_px_rate_base + mask * delta
                         px_rate = torch.exp(log_px_rate)
 
@@ -2467,12 +2470,12 @@ class ResolVIPredictiveMixin:
                     )
                     
                     # Apply shift to get perturbed px_rate
-                    log_px_rate_base = torch.log(px_rate_control + 1e-8)
+                    log_px_rate_base = torch.log(px_rate_control + 1e-12)
                     log_px_rate_perturbed = log_px_rate_base + delta  # No masking since all are perturbed
                     px_rate_perturbed = torch.exp(log_px_rate_perturbed)
                     
                     # Compute log fold change
-                    eps = 1e-8
+                    eps = 1e-12
                     control_safe = torch.clamp(px_rate_control, min=eps)
                     perturbed_safe = torch.clamp(px_rate_perturbed, min=eps)
                     
@@ -2616,7 +2619,7 @@ class ResolVIPredictiveMixin:
         indices: Sequence[int] | None = None,
         perturbation_list: Sequence[int] | None = None,
         gene_list: Sequence[str] | None = None,
-        n_samples: int = 5,
+        n_samples: int = 100,
         batch_size: int | None = None,
     ) -> dict:
         """
