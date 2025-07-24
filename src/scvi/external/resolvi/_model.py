@@ -178,11 +178,20 @@ class RESOLVI(
         dropout_rate: float = 0.05,
         dispersion: Literal["gene", "gene-batch"] = "gene",
         gene_likelihood: Literal["nb", "poisson"] = "nb",
-        background_ratio=None,
-        median_distance=None,
-        semisupervised=False,
-        mixture_k=50,
-        downsample_counts=True,
+        # background_ratio=None,
+        # median_distance=None,
+        # semisupervised=False,
+        # mixture_k=50,
+        # downsample_counts=True,
+        # downsample_counts_mean: float | None = None,
+        # downsample_counts_std: float = 1.0,
+        background_ratio: float | None = None,
+        median_distance: float | None = None,
+        semisupervised: bool = False,
+        mixture_k: int = 50,
+        downsample_counts: bool = True,
+        downsample_counts_mean: float | None = None,
+        downsample_counts_std: float = 1.0,
         perturbation_embed_dim: int = 16,
         perturbation_hidden_dim: int = 64,
         override_mixture_k_in_semisupervised: bool = True,
@@ -239,20 +248,51 @@ class RESOLVI(
 
         # expression_anntorchdata = AnnTorchDataset(
         #     self.adata_manager,
-        #     getitem_tensors=["X"],
         #     load_sparse_tensor=True,
         # )
 
         expression_anntorchdata = AnnTorchDataset(
             self.adata_manager,
-            getitem_tensors= [
-                REGISTRY_KEYS.X_KEY,
-                "index_neighbor",
-                "distance_neighbor",
-                REGISTRY_KEYS.SPATIAL_KEY,
+            getitem_tensors=[
+                REGISTRY_KEYS.X_KEY,            # gene counts
+                REGISTRY_KEYS.LIBRARY_KEY,      # library size / size factor
+                REGISTRY_KEYS.BATCH_KEY,        # batch indices
+                REGISTRY_KEYS.LABELS_KEY,       # labels (if any)
+                REGISTRY_KEYS.CAT_COVS_KEY,     # extra categorical covariates
+                REGISTRY_KEYS.PERTURBATION_KEY, # perturbation labels
+                "index_neighbor",               # k‑NN indices
+                "distance_neighbor",            # k‑NN distances
+                REGISTRY_KEYS.SPATIAL_KEY,      # spatial coords
             ],
             load_sparse_tensor=True,
         )
+
+
+        # expression_anntorchdata = AnnTorchDataset(
+        #     self.adata_manager,
+        #     getitem_tensors= [
+        #         REGISTRY_KEYS.X_KEY,
+        #         "index_neighbor",
+        #         "distance_neighbor",
+        #         REGISTRY_KEYS.SPATIAL_KEY,
+        #     ],
+        #     load_sparse_tensor=True,
+        # )
+
+        # ────────────────────────────────────────────────────────────
+        # 1) Compute data‑driven defaults only if user left them None
+        results = self.compute_dataset_dependent_priors()
+        if background_ratio is None:
+            background_ratio = results["background_ratio"]
+        if median_distance is None:
+            median_distance = results["median_distance"]
+        if downsample_counts:
+            downsample_counts_mean = results["mean_log_counts"]
+            downsample_counts_std  = results["std_log_counts"]
+        else:
+            downsample_counts_mean = None
+            downsample_counts_std  = 1.0
+        # ────────────────────────────────────────────────────────────
 
         # Initialize the module with spatial encoder
         self.module = RESOLVAE(
@@ -277,8 +317,22 @@ class RESOLVI(
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
             n_input_spatial=n_input_spatial,  # Pass spatial input dimension
+            # data driven priors
+            # ------------------------------------------------------------
+            background_ratio=background_ratio,
+            median_distance=median_distance,
+            downsample_counts_mean=downsample_counts_mean,
+            downsample_counts_std=downsample_counts_std,
             **model_kwargs,
+            # ------------------------------------------------------------
         )
+
+        # ─── Persist the priors as attributes on the Pyro module ─────────
+        # self.module.background_ratio = background_ratio
+        # self.module.median_distance = median_distance
+        # self.module.downsample_counts_mean = downsample_counts_mean
+        # self.module.downsample_counts_std = downsample_counts_std
+        # ────────────────────────────────────────────────────────────────
         
         # Set key information for background handling
         setup_args_dict = self.adata_manager._get_setup_method_args()

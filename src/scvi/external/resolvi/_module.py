@@ -226,6 +226,10 @@ class RESOLVAEModel(PyroModule):
         background_ratio: float = 0.1,
         prior_proportions_rate: float = 10.0,
         median_distance: float = 1.0,
+        #-------- just added for type error
+        downsample_counts_mean: float | None = None,
+        downsample_counts_std: float = 1.0,
+        #--------
         encode_covariates: bool = False,
         n_perturbs: int = 1,
         perturbation_embed_dim: int = 16,
@@ -309,6 +313,17 @@ class RESOLVAEModel(PyroModule):
                 ]
             ),
         )
+        # Persist the raw priors so model_unconditioned can see them
+        self.background_ratio = float(background_ratio)
+        # shouldn't be float, self.median_distance  = float(median_distance)
+        # Persist the median‐distance kernel width
+        self.register_buffer("median_distance", torch.tensor(median_distance))
+        # If you also passed downsample_counts_mean/std, store those too:
+        # debug: these variables may be in wrong location
+
+        # NO LONGER NEEDED
+        # self.downsample_counts_mean = float(downsample_counts_mean)
+        # self.downsample_counts_std  = float(downsample_counts_std)
         self.register_buffer("prior_proportions_rate", torch.tensor([prior_proportions_rate]))
 
         use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
@@ -367,9 +382,17 @@ class RESOLVAEModel(PyroModule):
         batch_index = tensor_dict.get(REGISTRY_KEYS.BATCH_KEY)
         cat_covs = tensor_dict.get(REGISTRY_KEYS.CAT_COVS_KEY)
         perturbation_data = tensor_dict.get(REGISTRY_KEYS.PERTURBATION_KEY)
-        x_n = tensor_dict.get("x_n")
-        distances_n = tensor_dict.get("distances_n")
+        x_n = tensor_dict.get("index_neighbor")
+        distances_n = tensor_dict.get("distance_neighbor")
         spatial_coords = tensor_dict.get(REGISTRY_KEYS.SPATIAL_KEY)  # Get spatial coordinates
+
+        # ─── debug print! ─────────────
+        print("╔═══ DEBUG distances_n ═══")
+        print("TensorDict keys:", list(tensor_dict.keys()))
+        print("x_n:", type(x_n), None if x_n is None else x_n.shape)
+        print("distances_n:", type(distances_n), None if distances_n is None else distances_n.shape)
+        print("╚═══════════════════════")
+        # ─────────────────────────
 
         input_dict = {
             "x": x,
