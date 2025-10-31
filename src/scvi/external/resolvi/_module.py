@@ -143,6 +143,7 @@ class ShiftNetGeneScale(torch.nn.Module):
             if expression_data.layout in [torch.sparse_csr, torch.sparse_csc]:
                 expression_data = expression_data.to_dense()
             means = torch.mean(expression_data, dim=0).float()
+            self.register_buffer("gene_means", means)
             
             # Build per-gene scale: proportional to mean + floor
             init_scale = means * global_k
@@ -255,10 +256,10 @@ class RESOLVAEModel(PyroModule):
         - If mixture_k>1: labels are mapped modulo mixture_k to available components
     shift_global_k
         Global scaling factor for per-gene shift initialization. The initial per-gene 
-        scale is computed as gene_mean * shift_global_k. Default is 2.0.
+        scale is computed as gene_mean * shift_global_k. Default is 3.0.
     shift_min_scale
         Minimum scale value for any gene in the shift network. Ensures that even 
-        low-expressed genes can have meaningful perturbation effects. Default is 0.05.
+        low-expressed genes can have meaningful perturbation effects. Default is 0.1.
     
     Notes
     -----
@@ -302,8 +303,8 @@ class RESOLVAEModel(PyroModule):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
-        shift_global_k: float = 2.0,
-        shift_min_scale: float = 0.05,
+        shift_global_k: float = 3.0,
+        shift_min_scale: float = 0.1,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -359,6 +360,15 @@ class RESOLVAEModel(PyroModule):
             global_k=shift_global_k,
             min_scale=shift_min_scale
         )
+
+        with torch.no_grad():
+            penalty_weights = torch.log1p(self.shift_net_gene_scale.gene_means)
+            if torch.all(penalty_weights <= 0):
+                penalty_weights = torch.ones_like(penalty_weights)
+            else:
+                penalty_weights = penalty_weights / torch.clamp(penalty_weights.mean(), min=1e-6)
+            penalty_weights = torch.clamp(penalty_weights, min=0.1)
+        self.register_buffer("control_penalty_weights", penalty_weights)
 
         if self.dispersion == "gene":
             init_px_r = torch.full([n_input], 0.01)
@@ -748,7 +758,15 @@ class RESOLVAEModel(PyroModule):
             pyro.sample("control_shifts", Delta(control_shifts).to_event(1), obs=control_shifts)
             
             # Add control penalty as a deterministic node for ELBO computation
-            control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
+            penalty_weights = getattr(self, "control_penalty_weights", None)
+            if penalty_weights is not None:
+                weight_view = penalty_weights
+                while weight_view.ndim < control_shifts.ndim:
+                    weight_view = weight_view.unsqueeze(0)
+                weighted_control = control_shifts.pow(2) * weight_view
+                control_penalty = torch.mean(weighted_control) * self.control_penalty_weight
+            else:
+                control_penalty = torch.mean(control_shifts ** 2) * self.control_penalty_weight
 
             pyro.deterministic("control_penalty", control_penalty)
 
@@ -1404,8 +1422,8 @@ class RESOLVAE(PyroBaseModuleClass):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
-        shift_global_k: float = 2.0,
-        shift_min_scale: float = 0.05,
+        shift_global_k: float = 3.0,
+        shift_min_scale: float = 0.1,
         latent_distribution: str | None = None,
     ):
         super().__init__()

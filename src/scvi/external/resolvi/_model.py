@@ -81,10 +81,10 @@ class RESOLVI(
     shift_global_k
         Global scaling factor for per-gene shift initialization. The initial per-gene 
         scale is computed as gene_mean * shift_global_k. Higher values allow larger 
-        perturbation effects. Default is 2.0.
+        perturbation effects. Default is 3.0.
     shift_min_scale
         Minimum scale value for any gene in the shift network. Ensures that even 
-        low-expressed genes can have meaningful perturbation effects. Default is 0.05.
+        low-expressed genes can have meaningful perturbation effects. Default is 0.1.
     **model_kwargs
         Keyword args for :class:`~scvi.module.VAE`
 
@@ -194,8 +194,8 @@ class RESOLVI(
         perturbation_hidden_dim: int = 64,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 1.0,
-        shift_global_k: float = 2.0,
-        shift_min_scale: float = 0.05,
+        shift_global_k: float = 3.0,
+        shift_min_scale: float = 0.1,
         **model_kwargs,
     ):
         pyro.clear_param_store()
