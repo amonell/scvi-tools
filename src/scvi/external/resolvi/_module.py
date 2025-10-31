@@ -45,21 +45,16 @@ class ControlPenaltyELBO(Trace_ELBO):
         """
         elbo_loss = 0.0
         control_penalty = 0.0
-        
+
         # Use parent class's _get_traces method
         for guide_trace, model_trace in self._get_traces(model, guide, args, kwargs):
             elbo_particle = guide_trace.log_prob_sum() - model_trace.log_prob_sum()
             elbo_loss += elbo_particle / self.num_particles
 
-        with pyro.poutine.trace() as tr:
-            model(*args, **kwargs)
-        separate_trace = tr.trace
-        
-        if "control_penalty" in separate_trace.nodes:
-            penalty_value = separate_trace.nodes["control_penalty"]["value"]
-            control_penalty = penalty_value
+            if "control_penalty" in model_trace.nodes:
+                penalty_value = model_trace.nodes["control_penalty"]["value"]
+                control_penalty += penalty_value / self.num_particles
 
-        
         # Return total loss (ELBO + control penalty)
         total_loss = -elbo_loss + control_penalty
 
@@ -102,6 +97,76 @@ def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: flo
     x_log = torch.log1p(x_normalized)
     # Handle any remaining invalid values (NaN, inf)
     return torch.where(torch.isfinite(x_log), x_log, torch.zeros_like(x_log))
+
+
+class ShiftNetGeneScale(torch.nn.Module):
+    """
+    Shift network with per-gene scaling based on expression levels.
+    
+    Parameters
+    ----------
+    input_dim
+        Input dimension (typically n_latent + perturbation_embed_dim)
+    n_genes
+        Number of genes
+    expression_data
+        Expression data to compute gene means for initialization
+    hidden_dim
+        Hidden layer dimension
+    global_k
+        Global scaling factor for initialization
+    min_scale
+        Minimum scale value for any gene
+    """
+    
+    def __init__(
+        self, 
+        input_dim: int, 
+        n_genes: int, 
+        expression_data: torch.Tensor,
+        hidden_dim: int = 64,
+        global_k: float = 4.0, 
+        min_scale: float = 0.1
+    ):
+        super().__init__()
+        
+        # The shift network that produces raw deltas
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, n_genes),
+            torch.nn.Tanh(),  # Bound outputs to [-1, 1]
+        )
+        
+        # Compute per-gene scaling based on expression means
+        with torch.no_grad():
+            if expression_data.layout in [torch.sparse_csr, torch.sparse_csc]:
+                expression_data = expression_data.to_dense()
+            means = torch.mean(expression_data, dim=0).float()
+            
+            # Build per-gene scale: proportional to mean + floor
+            init_scale = means * global_k
+            init_scale = torch.clamp(init_scale, min=min_scale)
+        
+        # Make it learnable so the model can adjust per gene
+        self.shift_scale = torch.nn.Parameter(init_scale)
+    
+    def forward(self, x):
+        """
+        Forward pass with per-gene scaling.
+        
+        Parameters
+        ----------
+        x
+            Input tensor [batch_size, input_dim] or [n_particles, batch_size, input_dim]
+            
+        Returns
+        -------
+        Per-gene scaled shifts [batch_size, n_genes] or [n_particles, batch_size, n_genes]
+        """
+        raw_delta = self.net(x)  # shape [batch, n_genes] or [n_particles, batch, n_genes]
+        delta = raw_delta * self.shift_scale  # per-gene scaling
+        return delta
 
 
 class RESOLVAEModel(PyroModule):
@@ -188,6 +253,12 @@ class RESOLVAEModel(PyroModule):
         label information is mapped to available mixture components:
         - If mixture_k=1: all cells use the same mixture component
         - If mixture_k>1: labels are mapped modulo mixture_k to available components
+    shift_global_k
+        Global scaling factor for per-gene shift initialization. The initial per-gene 
+        scale is computed as gene_mean * shift_global_k. Default is 2.0.
+    shift_min_scale
+        Minimum scale value for any gene in the shift network. Ensures that even 
+        low-expressed genes can have meaningful perturbation effects. Default is 0.05.
     
     Notes
     -----
@@ -231,6 +302,8 @@ class RESOLVAEModel(PyroModule):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
+        shift_global_k: float = 2.0,
+        shift_min_scale: float = 0.05,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -260,14 +333,32 @@ class RESOLVAEModel(PyroModule):
         
         # Perturbation embedding and shift network
         self.perturb_emb = torch.nn.Embedding(n_perturbs, perturbation_embed_dim)
-        self.shift_net = torch.nn.Sequential(
-            torch.nn.Linear(n_latent + perturbation_embed_dim, perturbation_hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(perturbation_hidden_dim, n_input),
-            torch.nn.Tanh(),  # Bound outputs to [-1, 1]
+        
+        # Get expression data for computing gene means
+        with torch.no_grad():
+            # Sample a few batches to estimate means (more memory efficient for large datasets)
+            n_samples = min(1000, len(expression_anntorchdata))
+            sample_indices = torch.randperm(len(expression_anntorchdata))[:n_samples]
+            sample_data = []
+            for idx in sample_indices:
+                x_sample = expression_anntorchdata[idx.item()]["X"]
+                if isinstance(x_sample, np.ndarray):
+                    x_sample = torch.from_numpy(x_sample)
+                # Convert sparse tensors to dense for stacking
+                if x_sample.layout in [torch.sparse_csr, torch.sparse_csc]:
+                    x_sample = x_sample.to_dense()
+                sample_data.append(x_sample)
+            expression_sample = torch.stack(sample_data)
+        
+        # Initialize ShiftNetGeneScale with expression data
+        self.shift_net_gene_scale = ShiftNetGeneScale(
+            input_dim=n_latent + perturbation_embed_dim,
+            n_genes=n_input,
+            expression_data=expression_sample,
+            hidden_dim=perturbation_hidden_dim,
+            global_k=shift_global_k,
+            min_scale=shift_min_scale
         )
-        # Scale factor for shift network output (bounds shifts to reasonable range)
-        self.shift_scale = 4.0  # Max shift magnitude in log space
 
         if self.dispersion == "gene":
             init_px_r = torch.full([n_input], 0.01)
@@ -623,7 +714,7 @@ class RESOLVAEModel(PyroModule):
                         # Expand u_k to match perturbed_z's dimensions
                         u_k = u_k.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
                     
-                    perturbed_delta = self.shift_scale * self.shift_net(torch.cat([perturbed_z, u_k], dim=-1))  # Scale constrained output
+                    perturbed_delta = self.shift_net_gene_scale(torch.cat([perturbed_z, u_k], dim=-1))  # Scale constrained output
                     
                     # Apply shifts only to perturbed cells, leave control and background cells unchanged
                     if z.ndim == 2:
@@ -1313,6 +1404,8 @@ class RESOLVAE(PyroBaseModuleClass):
         perturbation_idx: int | None = None,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 10.0,
+        shift_global_k: float = 2.0,
+        shift_min_scale: float = 0.05,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1403,6 +1496,8 @@ class RESOLVAE(PyroBaseModuleClass):
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
+            shift_global_k=shift_global_k,
+            shift_min_scale=shift_min_scale,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 

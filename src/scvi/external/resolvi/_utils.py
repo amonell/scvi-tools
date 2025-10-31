@@ -370,7 +370,9 @@ class ResolVIPredictiveMixin:
                 # No perturbation shifts applied - this returns baseline control expression
                 
                 if library_size is not None:
-                    exp_ = library_size * px_scale
+                    denom = px_rate.sum(dim=-1, keepdim=True)
+                    denom = torch.clamp(denom, min=1e-8)
+                    exp_ = library_size * (px_rate / denom)
                 else:
                     exp_ = px_rate
 
@@ -1981,7 +1983,9 @@ class ResolVIPredictiveMixin:
                 # No perturbation shifts applied - this returns baseline control expression
                 
                 if library_size is not None:
-                    exp_ = library_size * px_scale
+                    denom = px_rate.sum(dim=-1, keepdim=True)
+                    denom = torch.clamp(denom, min=1e-8)
+                    exp_ = library_size * (px_rate / denom)
                 else:
                     exp_ = px_rate
 
@@ -2142,7 +2146,9 @@ class ResolVIPredictiveMixin:
                         if z.ndim == 3 and u_k.ndim == 2:
                             u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
                         
-                        delta = self.module.model.shift_scale * self.module.model.shift_net(torch.cat([z, u_k], dim=-1))
+                        delta = self.module.model.shift_net_gene_scale(
+                            torch.cat([z, u_k], dim=-1)
+                        )
                         
                         # Apply shifts only to perturbed cells
                         mask = perturbed_mask.float().unsqueeze(-1)
@@ -2154,7 +2160,9 @@ class ResolVIPredictiveMixin:
                         px_rate = torch.exp(log_px_rate)
 
                 if library_size is not None:
-                    exp_ = library_size * px_scale
+                    denom = px_rate.sum(dim=-1, keepdim=True)
+                    denom = torch.clamp(denom, min=1e-8)
+                    exp_ = library_size * (px_rate / denom)
                 else:
                     exp_ = px_rate
 
@@ -2184,6 +2192,7 @@ class ResolVIPredictiveMixin:
         batch_size: int | None = None,
         return_numpy: bool | None = None,
         silent: bool = True,
+        control_perturbation: int | None = None,
     ) -> np.ndarray | pd.DataFrame:
         """
         Get raw shift network outputs (deltas) before masking or sampling.
@@ -2206,6 +2215,9 @@ class ResolVIPredictiveMixin:
             includes gene names as columns and cell indices as rows. If `None`, defaults to `False`.
         silent
             Whether to disable progress bar.
+        control_perturbation
+            If specified, control cells (perturbation_data == 0) will be passed through the shift
+            network as if they had this perturbation ID, instead of receiving zero shifts.
 
         Returns
         -------
@@ -2253,33 +2265,47 @@ class ResolVIPredictiveMixin:
             if kwargs["perturbation_data"] is not None:
                 perturb_idx = kwargs["perturbation_data"].long()
                 
-                # Only process perturbed cells (not control, not background) through shift network
-                # This matches the training logic:
-                # Control cells: perturbation_data == 0 (get zero shifts)
-                # Background cells: perturbation_data == -1 (get zero shifts)  
-                # Perturbed cells: perturbation_data > 0 (get actual shift network outputs)
+                # Identify different cell types
+                control_mask = (perturb_idx == 0)
+                background_mask = (perturb_idx == -1)
                 perturbed_mask = (perturb_idx > 0)
                 
+                # Initialize delta tensor
+                scaled_delta = torch.zeros(z.shape[0], self.module.model.n_input, device=z.device)
+                
+                # Process naturally perturbed cells
                 if perturbed_mask.any():
-                    # Only process perturbed cells through shift network
                     perturbed_perturb_idx = perturb_idx[perturbed_mask]
                     perturbed_z = z[perturbed_mask]
                     
                     u_k = self.module.model.perturb_emb(perturbed_perturb_idx)
                     
-                    # Get raw shift network outputs (before scaling)
-                    raw_delta = self.module.model.shift_net(torch.cat([perturbed_z, u_k], dim=-1))
-                    # Apply scaling to match what's used in the model
-                    perturbed_scaled_delta = self.module.model.shift_scale * raw_delta
-                    
-                    # Create full delta tensor with zeros for control and background cells
-                    scaled_delta = torch.zeros(z.shape[0], self.module.model.n_input, device=z.device)
+                    # Get scaled shift network outputs (matches model application)
+                    perturbed_scaled_delta = self.module.model.shift_net_gene_scale(
+                        torch.cat([perturbed_z, u_k], dim=-1)
+                    )
                     scaled_delta[perturbed_mask] = perturbed_scaled_delta
-                else:
-                    # No perturbed cells - all shifts are zero
-                    scaled_delta = torch.zeros(z.shape[0], self.module.model.n_input, device=z.device)
                 
-                # Return outputs that match training logic: zero for control/background, computed for perturbed
+                # Process control cells if control_perturbation is specified
+                if control_perturbation is not None and control_mask.any():
+                    control_z = z[control_mask]
+                    
+                    # Create perturbation tensor for control cells
+                    control_perturb_tensor = torch.full(
+                        (control_mask.sum(),), 
+                        control_perturbation, 
+                        device=z.device, 
+                        dtype=torch.long
+                    )
+                    
+                    u_k_control = self.module.model.perturb_emb(control_perturb_tensor)
+                    
+                    control_scaled_delta = self.module.model.shift_net_gene_scale(
+                        torch.cat([control_z, u_k_control], dim=-1)
+                    )
+                    scaled_delta[control_mask] = control_scaled_delta
+                
+                # Return computed shift outputs for all processed cells
                 shift_outputs.append(scaled_delta.cpu().numpy())
                 perturbation_indices.append(perturb_idx.cpu().numpy())
             else:
@@ -2465,7 +2491,7 @@ class ResolVIPredictiveMixin:
                         (batch_size_actual,), perturb_idx, device=device, dtype=torch.long
                     )
                     u_k = self.module.model.perturb_emb(perturb_tensor)
-                    delta = self.module.model.shift_scale * self.module.model.shift_net(
+                    delta = self.module.model.shift_net_gene_scale(
                         torch.cat([z_sample, u_k], dim=-1)
                     )
                     

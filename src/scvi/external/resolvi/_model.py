@@ -78,6 +78,13 @@ class RESOLVI(
         when semisupervised=True. If False, respects the user-provided mixture_k value
         even in semisupervised mode. This is useful when you have homogeneous cell types
         in your perturbation data and want to set mixture_k=1.
+    shift_global_k
+        Global scaling factor for per-gene shift initialization. The initial per-gene 
+        scale is computed as gene_mean * shift_global_k. Higher values allow larger 
+        perturbation effects. Default is 2.0.
+    shift_min_scale
+        Minimum scale value for any gene in the shift network. Ensures that even 
+        low-expressed genes can have meaningful perturbation effects. Default is 0.05.
     **model_kwargs
         Keyword args for :class:`~scvi.module.VAE`
 
@@ -187,6 +194,8 @@ class RESOLVI(
         perturbation_hidden_dim: int = 64,
         override_mixture_k_in_semisupervised: bool = True,
         control_penalty_weight: float = 1.0,
+        shift_global_k: float = 2.0,
+        shift_min_scale: float = 0.05,
         **model_kwargs,
     ):
         pyro.clear_param_store()
@@ -268,6 +277,8 @@ class RESOLVI(
             perturbation_idx=perturbation_idx,
             override_mixture_k_in_semisupervised=override_mixture_k_in_semisupervised,
             control_penalty_weight=control_penalty_weight,
+            shift_global_k=shift_global_k,
+            shift_min_scale=shift_min_scale,
             **model_kwargs,
         )
         
@@ -367,19 +378,29 @@ class RESOLVI(
             # Find background cells if background_key was specified
             background_indices = np.array([], dtype=int)
             background_key = setup_args.get('background_key')
-            
+            background_category = setup_args.get('background_category')
+
             if background_key is not None:
                 # Get background values for all cells
                 cell_backgrounds = self.adata.obs[background_key].cat.codes.values
-                
-                # Determine the correct background code based on key arrangement
+                background_categories = list(self.adata.obs[background_key].cat.categories)
+
                 if background_key == perturbation_key:
-                    # Same key: categories are [control, background, ...], so background is at index 1
-                    background_code = 1
+                    if background_category is None:
+                        raise ValueError(
+                            "When using the same key for perturbation and background, you must provide "
+                            "background_category in setup_anndata to identify background cells."
+                        )
+                if background_category is not None:
+                    if background_category not in background_categories:
+                        raise ValueError(
+                            f"Background category '{background_category}' not found in column '{background_key}'."
+                        )
+                    background_code = background_categories.index(background_category)
                 else:
-                    # Different key: background is at index 0
+                    # Default to the first category for separate background key
                     background_code = 0
-                
+
                 background_indices = np.where(cell_backgrounds == background_code)[0]
             
             # Identify perturbation-relevant cells (control + perturbed, excluding background)
@@ -541,22 +562,32 @@ class RESOLVI(
         # Check for background cells
         background_indices = np.array([], dtype=int)
         background_key = setup_args.get('background_key')
+        background_category = setup_args.get('background_category')
+        background_code = None
         
         if background_key is not None:
             # Get background values for all cells
             cell_backgrounds = self.adata.obs[background_key].cat.codes.values
+            background_categories = list(self.adata.obs[background_key].cat.categories)
             
             # Determine the correct background code based on key arrangement
             if background_key == perturbation_key:
-                # Same key: categories are [control, background, ...], so background is at index 1
-                # But in the model, background cells are marked as -1
-                background_code = 1
-                # Find cells that would be background (index 1 in original data)
-                background_indices = np.where(cell_backgrounds == background_code)[0]
+                if background_category is None:
+                    raise ValueError(
+                        "When using the same key for perturbation and background, you must provide "
+                        "background_category in setup_anndata to identify background cells."
+                    )
+            if background_category is not None:
+                if background_category not in background_categories:
+                    raise ValueError(
+                        f"Background category '{background_category}' not found in column '{background_key}'."
+                    )
+                background_code = background_categories.index(background_category)
             else:
-                # Different key: background is at index 0
+                # Different keys default to first category
                 background_code = 0
-                background_indices = np.where(cell_backgrounds == background_code)[0]
+
+            background_indices = np.where(cell_backgrounds == background_code)[0]
 
         # Create summary
         summary_data = []
@@ -564,6 +595,7 @@ class RESOLVI(
         
         # Check if we're using the same key for perturbation and background
         using_same_key = (background_key is not None and perturbation_key == background_key)
+        background_code_same_key = background_code if using_same_key else None
         
         for code, category_name in enumerate(category_names):
             n_cells = np.sum(category_codes == code)
@@ -572,8 +604,7 @@ class RESOLVI(
             
             # Determine if this is a background category
             if using_same_key:
-                # Same key: background is at index 1
-                is_background = (code == 1)
+                is_background = (background_code_same_key is not None and code == background_code_same_key)
             else:
                 # Different key: not a background category in perturbation field
                 is_background = False
@@ -596,14 +627,17 @@ class RESOLVI(
         if len(background_indices) > 0 and background_key and background_key != perturbation_key:
             background_categories = self.adata.obs[background_key].cat.categories.tolist()
             background_codes = self.adata.obs[background_key].cat.codes.values
+            background_code_diff_key = background_code
             
             for code, category_name in enumerate(background_categories):
                 n_cells = np.sum(background_codes == code)
                 if n_cells > 0:
                     percentage = (n_cells / total_cells) * 100
                     
-                    # Different key: background is at index 0
-                    is_background = (code == 0)
+                    # Identify background based on configured category (defaults to first category)
+                    is_background = (
+                        background_code_diff_key is not None and code == background_code_diff_key
+                    )
                     
                     summary_data.append({
                         'perturbation_category': f"[Background] {category_name}",

@@ -3,17 +3,19 @@
 # Set default logging handler to avoid logging with logging.lastResort logger.
 import logging
 import warnings
+from importlib.metadata import PackageNotFoundError, version
 
 from ._constants import REGISTRY_KEYS
 from ._settings import settings
 
+package_name = "scvi-tools"
+try:
+    __version__ = version(package_name)
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
 # this import needs to come after prior imports to prevent circular import
 from . import data, model, external, utils
-
-from importlib.metadata import version
-
-package_name = "scvi-tools"
-__version__ = version(package_name)
 
 settings.verbosity = logging.INFO
 
