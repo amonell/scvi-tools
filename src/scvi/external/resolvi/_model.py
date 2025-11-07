@@ -234,6 +234,8 @@ class RESOLVI(
             # Just use defaults
             pass
 
+        spatial_embedding_dim = getattr(self.summary_stats, "n_spatial_embedding", 0) or 0
+
         if background_ratio is None:
             background_ratio = results["background_ratio"]
         if median_distance is None:
@@ -279,6 +281,7 @@ class RESOLVI(
             control_penalty_weight=control_penalty_weight,
             shift_global_k=shift_global_k,
             shift_min_scale=shift_min_scale,
+            spatial_embedding_dim=spatial_embedding_dim,
             **model_kwargs,
         )
         
@@ -685,6 +688,7 @@ class RESOLVI(
         control_perturbation: str | None = None,
         background_key: str | None = None,
         background_category: str | None = None,
+        spatial_embedding_key: str | None = None,
         prepare_data: bool | None = True,
         prepare_data_kwargs: dict = None,
         unlabeled_category: str = "unknown",
@@ -717,6 +721,11 @@ class RESOLVI(
             Value in background_key column that represents background cells.
             If None and background_key is provided, the first category will be used.
             Should be different from control_perturbation if using the same key.
+        spatial_embedding_key
+            Optional ``adata.obsm`` key that stores spatial embeddings (any dimensionality)
+            used to condition the perturbation shift network. Examples include
+            ``"X_cellcharter"`` or any other spatial representation. If ``None``, the
+            shift network only receives the gene-expression latent state.
         prepare_data
             If True, prepares AnnData for training. Computes spatial neighbors and distances.
         prepare_data_kwargs
@@ -841,6 +850,9 @@ class RESOLVI(
         # Add perturbation field separately if it exists
         if perturbation_field is not None:
             anndata_fields.append(perturbation_field)
+
+        if spatial_embedding_key is not None:
+            anndata_fields.append(ObsmField("spatial_embedding", spatial_embedding_key))
         
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)

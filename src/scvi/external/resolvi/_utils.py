@@ -2134,27 +2134,33 @@ class ResolVIPredictiveMixin:
                 # Apply actual perturbation shifts based on real perturbation indices
                 if kwargs["perturbation_data"] is not None:
                     perturb_idx = kwargs["perturbation_data"].long()
-                    
-                    # Only apply shifts to perturbed cells (perturbation_data > 0)
-                    # Control cells (0) and background cells (-1) should get zero shifts
-                    perturbed_mask = (perturb_idx > 0)
-                    
+                    perturbed_mask = perturb_idx > 0
+
                     if perturbed_mask.any():
-                        # Get embeddings for all cells (needed for shift network input)
                         u_k = self.module.model.perturb_emb(perturb_idx)
-                        
                         if z.ndim == 3 and u_k.ndim == 2:
                             u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
-                        
+
+                        shift_inputs = [z, u_k]
+
+                        spatial_embedding = kwargs.get("spatial_embedding")
+                        if (
+                            self.module.model.spatial_embedding_dim > 0
+                            and spatial_embedding is not None
+                        ):
+                            spatial_part = spatial_embedding
+                            if z.ndim == 3 and spatial_part.ndim == 2:
+                                spatial_part = spatial_part.unsqueeze(0).expand(z.shape[0], -1, -1)
+                            shift_inputs.append(spatial_part)
+
                         delta = self.module.model.shift_net_gene_scale(
-                            torch.cat([z, u_k], dim=-1)
+                            torch.cat(shift_inputs, dim=-1)
                         )
-                        
-                        # Apply shifts only to perturbed cells
+
                         mask = perturbed_mask.float().unsqueeze(-1)
                         if z.ndim == 3:
                             mask = mask.unsqueeze(0)
-                        
+
                         log_px_rate_base = torch.log(px_rate + 1e-12)
                         log_px_rate = log_px_rate_base + mask * delta
                         px_rate = torch.exp(log_px_rate)
@@ -2261,6 +2267,8 @@ class ResolVIPredictiveMixin:
             # Use mean of latent distribution for consistency
             z = qz_m
 
+            spatial_embedding = kwargs.get("spatial_embedding")
+
             # Get perturbation data and embeddings
             if kwargs["perturbation_data"] is not None:
                 perturb_idx = kwargs["perturbation_data"].long()
@@ -2279,10 +2287,17 @@ class ResolVIPredictiveMixin:
                     perturbed_z = z[perturbed_mask]
                     
                     u_k = self.module.model.perturb_emb(perturbed_perturb_idx)
+
+                    shift_inputs = [perturbed_z, u_k]
+                    if (
+                        self.module.model.spatial_embedding_dim > 0
+                        and spatial_embedding is not None
+                    ):
+                        perturbed_spatial = spatial_embedding[perturbed_mask]
+                        shift_inputs.append(perturbed_spatial)
                     
-                    # Get scaled shift network outputs (matches model application)
                     perturbed_scaled_delta = self.module.model.shift_net_gene_scale(
-                        torch.cat([perturbed_z, u_k], dim=-1)
+                        torch.cat(shift_inputs, dim=-1)
                     )
                     scaled_delta[perturbed_mask] = perturbed_scaled_delta
                 
@@ -2290,7 +2305,6 @@ class ResolVIPredictiveMixin:
                 if control_perturbation is not None and control_mask.any():
                     control_z = z[control_mask]
                     
-                    # Create perturbation tensor for control cells
                     control_perturb_tensor = torch.full(
                         (control_mask.sum(),), 
                         control_perturbation, 
@@ -2299,9 +2313,17 @@ class ResolVIPredictiveMixin:
                     )
                     
                     u_k_control = self.module.model.perturb_emb(control_perturb_tensor)
+
+                    control_inputs = [control_z, u_k_control]
+                    if (
+                        self.module.model.spatial_embedding_dim > 0
+                        and spatial_embedding is not None
+                    ):
+                        control_spatial = spatial_embedding[control_mask]
+                        control_inputs.append(control_spatial)
                     
                     control_scaled_delta = self.module.model.shift_net_gene_scale(
-                        torch.cat([control_z, u_k_control], dim=-1)
+                        torch.cat(control_inputs, dim=-1)
                     )
                     scaled_delta[control_mask] = control_scaled_delta
                 
@@ -2454,6 +2476,7 @@ class ResolVIPredictiveMixin:
         for tensors in track(scdl, disable=silent):
             _, kwargs = self.module._get_fn_args_from_batch(tensors)
             kwargs = {k: v.to(device) if v is not None else v for k, v in kwargs.items()}
+            spatial_embedding = kwargs.get("spatial_embedding")
             
             batch_size_actual = kwargs["x"].shape[0]
             z_batch = z_fixed[:batch_size_actual, :]
@@ -2491,8 +2514,16 @@ class ResolVIPredictiveMixin:
                         (batch_size_actual,), perturb_idx, device=device, dtype=torch.long
                     )
                     u_k = self.module.model.perturb_emb(perturb_tensor)
+
+                    shift_inputs = [z_sample, u_k]
+                    if (
+                        self.module.model.spatial_embedding_dim > 0
+                        and spatial_embedding is not None
+                    ):
+                        shift_inputs.append(spatial_embedding)
+
                     delta = self.module.model.shift_net_gene_scale(
-                        torch.cat([z_sample, u_k], dim=-1)
+                        torch.cat(shift_inputs, dim=-1)
                     )
                     
                     # Apply shift to get perturbed px_rate

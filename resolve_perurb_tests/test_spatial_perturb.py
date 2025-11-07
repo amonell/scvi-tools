@@ -48,7 +48,8 @@ def render_scanpy_plot(
 
     try:
         obj = plot_fn(*args, show=show, return_fig=True, **kwargs)
-    except TypeError:
+    except (TypeError, AttributeError):
+        # Some Scanpy wrappers forward unexpected kwargs downstream; retry without return_fig.
         obj = plot_fn(*args, show=show, **kwargs)
     return _ensure_matplotlib_figure(obj)
 
@@ -61,6 +62,7 @@ class SpatialPerturbationConfig:
     target_gene: str = "Ccl5"
     control_label: str = "Other cells"
     control_perturbation: str = "sgCd19"
+    spatial_embedding_key: str | None = "X_cellcharter"
     n_samples: int = 1000
     resolvi_setup_kwargs: Dict[str, object] = field(default_factory=dict)
     resolvi_model_kwargs: Dict[str, object] = field(default_factory=dict)
@@ -98,6 +100,11 @@ class SpatialPerturbationConfig:
                 "background_key": "guide_rnas",
                 "background_category": self.control_label,
             }
+        if (
+            self.spatial_embedding_key is not None
+            and "spatial_embedding_key" not in self.resolvi_setup_kwargs
+        ):
+            self.resolvi_setup_kwargs["spatial_embedding_key"] = self.spatial_embedding_key
         if not self.resolvi_model_kwargs:
             self.resolvi_model_kwargs = {
                 "semisupervised": True,

@@ -305,6 +305,7 @@ class RESOLVAEModel(PyroModule):
         control_penalty_weight: float = 10.0,
         shift_global_k: float = 3.0,
         shift_min_scale: float = 0.1,
+        spatial_embedding_dim: int = 0,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -327,6 +328,7 @@ class RESOLVAEModel(PyroModule):
         self.n_perturbs = n_perturbs
         self.perturbation_idx = perturbation_idx  # Index of perturbation in cat_covs
         self.control_penalty_weight = control_penalty_weight
+        self.spatial_embedding_dim = spatial_embedding_dim
         
         # Store key information for background handling
         self.background_key = None  # Will be set by setup_anndata
@@ -353,7 +355,7 @@ class RESOLVAEModel(PyroModule):
         
         # Initialize ShiftNetGeneScale with expression data
         self.shift_net_gene_scale = ShiftNetGeneScale(
-            input_dim=n_latent + perturbation_embed_dim,
+            input_dim=n_latent + perturbation_embed_dim + spatial_embedding_dim,
             n_genes=n_input,
             expression_data=expression_sample,
             hidden_dim=perturbation_hidden_dim,
@@ -488,6 +490,12 @@ class RESOLVAEModel(PyroModule):
         distances_n = tensor_dict["distance_neighbor"]
         ind_neighbors = tensor_dict["index_neighbor"].long()
 
+        spatial_embedding = tensor_dict.get("spatial_embedding")
+        if spatial_embedding is not None:
+            if isinstance(spatial_embedding, np.ndarray):
+                spatial_embedding = torch.from_numpy(spatial_embedding)
+            spatial_embedding = spatial_embedding.to(x.device)
+
         x_n = self.expression_anntorchdata[ind_neighbors.cpu().numpy().flatten(), :]["X"]
         if isinstance(x_n, np.ndarray):
             x_n = torch.from_numpy(x_n)
@@ -510,6 +518,7 @@ class RESOLVAEModel(PyroModule):
             "perturbation_data": perturbation_data,
             "x_n": x_n,
             "distances_n": distances_n,
+            "spatial_embedding": spatial_embedding,
         }
 
     @auto_move_data
@@ -524,6 +533,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_embedding: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -724,7 +734,16 @@ class RESOLVAEModel(PyroModule):
                         # Expand u_k to match perturbed_z's dimensions
                         u_k = u_k.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
                     
-                    perturbed_delta = self.shift_net_gene_scale(torch.cat([perturbed_z, u_k], dim=-1))  # Scale constrained output
+                    shift_inputs = [perturbed_z, u_k]
+
+                    if self.spatial_embedding_dim > 0 and spatial_embedding is not None:
+                        perturbed_spatial = spatial_embedding[perturbed_mask]
+                        if perturbed_z.ndim == 3 and perturbed_spatial.ndim == 2:
+                            perturbed_spatial = perturbed_spatial.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)
+                        perturbed_spatial = perturbed_spatial.to(perturbed_z.device)
+                        shift_inputs.append(perturbed_spatial)
+
+                    perturbed_delta = self.shift_net_gene_scale(torch.cat(shift_inputs, dim=-1))  # Scale constrained output
                     
                     # Apply shifts only to perturbed cells, leave control and background cells unchanged
                     if z.ndim == 2:
@@ -896,13 +915,25 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_embedding: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
         """Forward pass."""
         # Using condition handle for training, this is the reconstruction loss.
         pyro.condition(self.model_unconditioned, data={"obs": x})(
-            x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight
+            x,
+            ind_x,
+            library,
+            y,
+            batch_index,
+            cat_covs,
+            perturbation_data,
+            x_n,
+            distances_n,
+            spatial_embedding,
+            n_obs,
+            kl_weight,
         )
 
     @auto_move_data
@@ -917,6 +948,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_embedding: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -927,7 +959,20 @@ class RESOLVAEModel(PyroModule):
                 "diffusion_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
                 "true_mixture_proportion": torch.ones(x.shape[0], device=x.device),
             },
-        )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight)
+        )(
+            x,
+            ind_x,
+            library,
+            y,
+            batch_index,
+            cat_covs,
+            perturbation_data,
+            x_n,
+            distances_n,
+            spatial_embedding,
+            n_obs,
+            kl_weight,
+        )
 
     @auto_move_data
     def model_residuals(
@@ -941,6 +986,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_embedding: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -949,7 +995,20 @@ class RESOLVAEModel(PyroModule):
             data={
                 "true_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
             },
-        )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight)
+        )(
+            x,
+            ind_x,
+            library,
+            y,
+            batch_index,
+            cat_covs,
+            perturbation_data,
+            x_n,
+            distances_n,
+            spatial_embedding,
+            n_obs,
+            kl_weight,
+        )
 
     @auto_move_data
     def model_simplified(
@@ -963,6 +1022,7 @@ class RESOLVAEModel(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_embedding: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
         corrected_rate: bool = False,
@@ -995,10 +1055,34 @@ class RESOLVAEModel(PyroModule):
                         "diffusion_mixture_proportion": torch.zeros(x.shape[0], device=x.device),
                         "true_mixture_proportion": torch.ones(x.shape[0], device=x.device),
                     },
-                )(x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight)
+                )(
+                    x,
+                    ind_x,
+                    library,
+                    y,
+                    batch_index,
+                    cat_covs,
+                    perturbation_data,
+                    x_n,
+                    distances_n,
+                    spatial_embedding,
+                    n_obs,
+                    kl_weight,
+                )
             else:
                 simplified_model(
-                    x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight
+                    x,
+                    ind_x,
+                    library,
+                    y,
+                    batch_index,
+                    cat_covs,
+                    perturbation_data,
+                    x_n,
+                    distances_n,
+                    spatial_embedding,
+                    n_obs,
+                    kl_weight,
                 )
 
 
@@ -1137,6 +1221,7 @@ class RESOLVAEGuide(PyroModule):
         perturbation_data,
         x_n,
         distances_n,
+        spatial_embedding=None,
         n_obs=None,
         kl_weight=1.0,
     ):
@@ -1267,6 +1352,7 @@ class RESOLVAEGuide(PyroModule):
         perturbation_data: torch.Tensor,
         x_n: torch.Tensor,
         distances_n: torch.Tensor,
+        spatial_embedding: torch.Tensor | None = None,
         n_obs: int | None = None,
         kl_weight: float = 1.0,
     ):
@@ -1288,7 +1374,18 @@ class RESOLVAEGuide(PyroModule):
 
         with pyro.poutine.scale(scale=x.shape[0] / self.n_obs):
             simplified_guide(
-                x, ind_x, library, y, batch_index, cat_covs, perturbation_data, x_n, distances_n, n_obs, kl_weight
+                x,
+                ind_x,
+                library,
+                y,
+                batch_index,
+                cat_covs,
+                perturbation_data,
+                x_n,
+                distances_n,
+                spatial_embedding,
+                n_obs,
+                kl_weight,
             )
 
 
@@ -1424,6 +1521,7 @@ class RESOLVAE(PyroBaseModuleClass):
         control_penalty_weight: float = 10.0,
         shift_global_k: float = 3.0,
         shift_min_scale: float = 0.1,
+        spatial_embedding_dim: int = 0,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1516,6 +1614,7 @@ class RESOLVAE(PyroBaseModuleClass):
             control_penalty_weight=control_penalty_weight,
             shift_global_k=shift_global_k,
             shift_min_scale=shift_min_scale,
+            spatial_embedding_dim=spatial_embedding_dim,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 
