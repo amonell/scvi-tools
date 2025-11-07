@@ -32,3 +32,4 @@ __pycache__/
 
 /resolve_perurb_tests/supervised_resolvi.model/*
 /resolve_perurb_tests/perturb_model.model/*
+/resolve_perurb_tests/figures/*
