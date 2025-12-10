@@ -711,53 +711,58 @@ class RESOLVAEModel(PyroModule):
                 delta = torch.zeros(z.shape[0], self.n_input, device=z.device)
             else:
                 delta = torch.zeros(z.shape[0], z.shape[1], self.n_input, device=z.device)
-            
+
             if perturbation_data is not None:
                 px_rate_pre_shift = px_rate.clone()
-                
-                # Only process perturbed cells (not control, not background) through shift network
-                # Control cells: perturbation_data == 0 (skip shift network entirely)
-                # Background cells: perturbation_data == -1 (skip shift network entirely)
-                # Perturbed cells: perturbation_data > 0 (process through shift network)
-                perturbed_mask = (perturbation_data > 0)
-                
-                if perturbed_mask.any():
-                    # Only process perturbed cells through shift network
-                    perturbed_perturbation_data = perturbation_data[perturbed_mask]
 
-                    u_k = self.perturb_emb(perturbed_perturbation_data.long())  # → (n_perturbed_cells, D_s)
+                # Compute shifts for all non-background cells (controls + perturbed) so the
+                # spatial branch is seen by the control penalty. Background cells (-1) are skipped.
+                non_background_mask = perturbation_data != -1
+                if non_background_mask.any():
+                    # Use control embedding (0) for controls; actual code for perturbed
+                    perturb_codes = perturbation_data.clone()
+                    perturb_codes[perturb_codes < 0] = 0
+                    non_bg_codes = perturb_codes[non_background_mask]
+
+                    u_k = self.perturb_emb(non_bg_codes.long())  # → (n_non_bg_cells, D_s)
 
                     # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
                     if z.ndim == 3 and u_k.ndim == 2:
                         # Expand u_k to match particle dimension
-                        u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
+                        u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)  # → [n_particles, n_non_bg_cells, embedding_dim]
 
                     shift_inputs = [u_k]
 
                     if self.spatial_embedding_dim > 0 and spatial_embedding is not None:
-                        perturbed_spatial = spatial_embedding[perturbed_mask]
-                        if z.ndim == 3 and perturbed_spatial.ndim == 2:
-                            perturbed_spatial = perturbed_spatial.unsqueeze(0).expand(z.shape[0], -1, -1)
-                        perturbed_spatial = perturbed_spatial.to(u_k.device)
-                        shift_inputs.append(perturbed_spatial)
+                        spatial_non_bg = spatial_embedding[non_background_mask]
+                        if z.ndim == 3 and spatial_non_bg.ndim == 2:
+                            spatial_non_bg = spatial_non_bg.unsqueeze(0).expand(z.shape[0], -1, -1)
+                        spatial_non_bg = spatial_non_bg.to(u_k.device)
+                        shift_inputs.append(spatial_non_bg)
 
-                    perturbed_delta = self.shift_net_gene_scale(torch.cat(shift_inputs, dim=-1))  # Scale constrained output
-                    
-                    # Apply shifts only to perturbed cells, leave control and background cells unchanged
+                    non_bg_delta = self.shift_net_gene_scale(torch.cat(shift_inputs, dim=-1))  # Scale constrained output
+
+                    # Write shifts for controls+perturbed; background remains zero
                     if z.ndim == 2:
-                        delta[perturbed_mask] = perturbed_delta
+                        delta[non_background_mask] = non_bg_delta
                     else:
-                        delta[:, perturbed_mask, :] = perturbed_delta
-                
-                # Debug: Check what's happening
-                control_mask = (perturbation_data == 0)
-                background_mask = (perturbation_data == -1)
-                
-                # Apply shifts to ALL cells (control cells get zero shifts, perturbed cells get computed shifts)
+                        delta[:, non_background_mask, :] = non_bg_delta
+
+                # Masks
+                control_mask = perturbation_data == 0
+                background_mask = perturbation_data == -1
+                perturbed_mask = perturbation_data > 0
+
+                # Apply shifts only to perturbed cells; zero out control/background for application
+                apply_mask = perturbed_mask.float().unsqueeze(-1)
+                if z.ndim == 3:
+                    apply_mask = apply_mask.unsqueeze(0)
+
+                delta_applied = delta * apply_mask
+
                 # Work in log-space: log(λ) = log(λ_base) + δ, then λ = exp(log(λ_base) + δ)
-                # This ensures λ > 0 even with negative δ
                 log_px_rate_base = torch.log(px_rate + 1e-12)  # Add small epsilon to avoid log(0)
-                log_px_rate = log_px_rate_base + delta  # Apply shifts (zero for control/background, computed for perturbed)
+                log_px_rate = log_px_rate_base + delta_applied
                 px_rate = torch.exp(log_px_rate)
             else:
                 # No perturbation data - delta remains all zeros
@@ -769,7 +774,7 @@ class RESOLVAEModel(PyroModule):
             control_mask_for_penalty = (perturbation_data == 0).float().unsqueeze(-1) if perturbation_data is not None else torch.zeros(z.shape[0], 1, device=z.device)
             if z.ndim == 3:  # particles dimension
                 control_mask_for_penalty = control_mask_for_penalty.unsqueeze(0)
-            control_shifts = delta * control_mask_for_penalty  # Should always be zero now
+            control_shifts = delta * control_mask_for_penalty  # Penalizes spatial-aware control shifts
             
             # Use sample with Delta distribution and observe it to ensure it appears in trace
             pyro.sample("control_shifts", Delta(control_shifts).to_event(1), obs=control_shifts)

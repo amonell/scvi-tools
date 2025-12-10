@@ -2506,7 +2506,24 @@ class ResolVIPredictiveMixin:
                 
                 sample_effects = []
                 for perturb_idx in perturbation_list:
-                    # Get perturbation embedding and shift
+                    # Base log-rate
+                    log_px_rate_base = torch.log(px_rate_control + 1e-12)
+
+                    # Control spatial baseline delta
+                    if self.module.model.spatial_embedding_dim > 0 and spatial_embedding is not None:
+                        control_embed = self.module.model.perturb_emb(
+                            torch.zeros(batch_size_actual, device=device, dtype=torch.long)
+                        )
+                        control_inputs = [control_embed, spatial_embedding]
+                        delta_control = self.module.model.shift_net_gene_scale(
+                            torch.cat(control_inputs, dim=-1)
+                        )
+                    else:
+                        delta_control = torch.zeros_like(px_rate_control)
+
+                    px_rate_control_spatial = torch.exp(log_px_rate_base + delta_control)
+
+                    # Perturbation delta with spatial
                     perturb_tensor = torch.full(
                         (batch_size_actual,), perturb_idx, device=device, dtype=torch.long
                     )
@@ -2519,18 +2536,16 @@ class ResolVIPredictiveMixin:
                     ):
                         shift_inputs.append(spatial_embedding)
 
-                    delta = self.module.model.shift_net_gene_scale(
+                    delta_perturbed = self.module.model.shift_net_gene_scale(
                         torch.cat(shift_inputs, dim=-1)
                     )
                     
-                    # Apply shift to get perturbed px_rate
-                    log_px_rate_base = torch.log(px_rate_control + 1e-12)
-                    log_px_rate_perturbed = log_px_rate_base + delta  # No masking since all are perturbed
+                    log_px_rate_perturbed = log_px_rate_base + delta_perturbed  # No masking since all are perturbed
                     px_rate_perturbed = torch.exp(log_px_rate_perturbed)
                     
                     # Compute log fold change
                     eps = 1e-12
-                    control_safe = torch.clamp(px_rate_control, min=eps)
+                    control_safe = torch.clamp(px_rate_control_spatial, min=eps)
                     perturbed_safe = torch.clamp(px_rate_perturbed, min=eps)
                     
                     log_fc = torch.log2(perturbed_safe / control_safe)  # [batch_size, n_genes]
