@@ -2141,7 +2141,7 @@ class ResolVIPredictiveMixin:
                         if z.ndim == 3 and u_k.ndim == 2:
                             u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)
 
-                        shift_inputs = [z, u_k]
+                        shift_inputs = [u_k]
 
                         spatial_embedding = kwargs.get("spatial_embedding")
                         if (
@@ -2284,11 +2284,10 @@ class ResolVIPredictiveMixin:
                 # Process naturally perturbed cells
                 if perturbed_mask.any():
                     perturbed_perturb_idx = perturb_idx[perturbed_mask]
-                    perturbed_z = z[perturbed_mask]
-                    
+
                     u_k = self.module.model.perturb_emb(perturbed_perturb_idx)
 
-                    shift_inputs = [perturbed_z, u_k]
+                    shift_inputs = [u_k]
                     if (
                         self.module.model.spatial_embedding_dim > 0
                         and spatial_embedding is not None
@@ -2303,8 +2302,6 @@ class ResolVIPredictiveMixin:
                 
                 # Process control cells if control_perturbation is specified
                 if control_perturbation is not None and control_mask.any():
-                    control_z = z[control_mask]
-                    
                     control_perturb_tensor = torch.full(
                         (control_mask.sum(),), 
                         control_perturbation, 
@@ -2314,7 +2311,7 @@ class ResolVIPredictiveMixin:
                     
                     u_k_control = self.module.model.perturb_emb(control_perturb_tensor)
 
-                    control_inputs = [control_z, u_k_control]
+                    control_inputs = [u_k_control]
                     if (
                         self.module.model.spatial_embedding_dim > 0
                         and spatial_embedding is not None
@@ -2515,7 +2512,7 @@ class ResolVIPredictiveMixin:
                     )
                     u_k = self.module.model.perturb_emb(perturb_tensor)
 
-                    shift_inputs = [z_sample, u_k]
+                    shift_inputs = [u_k]
                     if (
                         self.module.model.spatial_embedding_dim > 0
                         and spatial_embedding is not None

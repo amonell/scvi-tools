@@ -355,7 +355,7 @@ class RESOLVAEModel(PyroModule):
         
         # Initialize ShiftNetGeneScale with expression data
         self.shift_net_gene_scale = ShiftNetGeneScale(
-            input_dim=n_latent + perturbation_embed_dim + spatial_embedding_dim,
+            input_dim=perturbation_embed_dim + spatial_embedding_dim,
             n_genes=n_input,
             expression_data=expression_sample,
             hidden_dim=perturbation_hidden_dim,
@@ -724,23 +724,21 @@ class RESOLVAEModel(PyroModule):
                 if perturbed_mask.any():
                     # Only process perturbed cells through shift network
                     perturbed_perturbation_data = perturbation_data[perturbed_mask]
-                    perturbed_z = z[perturbed_mask] if z.ndim == 2 else z[:, perturbed_mask, :]
-                    
+
                     u_k = self.perturb_emb(perturbed_perturbation_data.long())  # → (n_perturbed_cells, D_s)
-                    
+
                     # Handle dimension mismatch when z has particle dimension (vectorized ELBO)
-                    if perturbed_z.ndim == 3 and u_k.ndim == 2:
-                        # perturbed_z: [n_particles, n_perturbed_cells, n_latent], u_k: [n_perturbed_cells, embedding_dim]
-                        # Expand u_k to match perturbed_z's dimensions
-                        u_k = u_k.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
-                    
-                    shift_inputs = [perturbed_z, u_k]
+                    if z.ndim == 3 and u_k.ndim == 2:
+                        # Expand u_k to match particle dimension
+                        u_k = u_k.unsqueeze(0).expand(z.shape[0], -1, -1)  # → [n_particles, n_perturbed_cells, embedding_dim]
+
+                    shift_inputs = [u_k]
 
                     if self.spatial_embedding_dim > 0 and spatial_embedding is not None:
                         perturbed_spatial = spatial_embedding[perturbed_mask]
-                        if perturbed_z.ndim == 3 and perturbed_spatial.ndim == 2:
-                            perturbed_spatial = perturbed_spatial.unsqueeze(0).expand(perturbed_z.shape[0], -1, -1)
-                        perturbed_spatial = perturbed_spatial.to(perturbed_z.device)
+                        if z.ndim == 3 and perturbed_spatial.ndim == 2:
+                            perturbed_spatial = perturbed_spatial.unsqueeze(0).expand(z.shape[0], -1, -1)
+                        perturbed_spatial = perturbed_spatial.to(u_k.device)
                         shift_inputs.append(perturbed_spatial)
 
                     perturbed_delta = self.shift_net_gene_scale(torch.cat(shift_inputs, dim=-1))  # Scale constrained output
