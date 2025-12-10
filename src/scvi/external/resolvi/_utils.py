@@ -3,8 +3,10 @@ import warnings
 from collections.abc import Sequence
 from functools import partial
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scanpy as sc
 import torch
 from anndata import AnnData
 from pyro import infer
@@ -2367,6 +2369,234 @@ class ResolVIPredictiveMixin:
                 pass
                 
             return df
+
+    @torch.inference_mode()
+    def store_denoised_layers(
+        self,
+        adata: AnnData | None = None,
+        control_layer: str = "resolvi_expression_no_shift",
+        perturbed_layer: str = "resolvi_expression_with_shift",
+        indices: Sequence[int] | np.ndarray | None = None,
+        n_samples: int = 1000,
+        batch_size: int | None = None,
+        silent: bool = True,
+    ) -> None:
+        """
+        Compute and store control/perturbed denoised expressions into ``adata.layers``.
+        """
+        adata = self._validate_anndata(adata)
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        indices_arr = np.asarray(indices)
+
+        control_expr = self.get_denoised_expression_control(
+            adata=adata,
+            indices=indices_arr,
+            n_samples=n_samples,
+            batch_size=batch_size,
+            return_mean=True,
+            return_numpy=True,
+            silent=silent,
+        )
+        perturbed_expr = self.get_denoised_expression_perturbed(
+            adata=adata,
+            indices=indices_arr,
+            n_samples=n_samples,
+            batch_size=batch_size,
+            return_mean=True,
+            return_numpy=True,
+            silent=silent,
+        )
+
+        control_mat = np.full((adata.n_obs, adata.n_vars), np.nan, dtype=float)
+        perturbed_mat = np.full((adata.n_obs, adata.n_vars), np.nan, dtype=float)
+        control_mat[indices_arr] = control_expr
+        perturbed_mat[indices_arr] = perturbed_expr
+
+        adata.layers[control_layer] = control_mat
+        adata.layers[perturbed_layer] = perturbed_mat
+
+    @torch.inference_mode()
+    def compute_and_store_raw_shifts(
+        self,
+        adata: AnnData | None = None,
+        control_layer: str = "resolvi_expression_no_shift",
+        perturbed_layer: str = "resolvi_expression_with_shift",
+        shift_layer: str = "resolvi_raw_shifts",
+        mask: Sequence[bool] | np.ndarray | None = None,
+    ) -> None:
+        """
+        Compute raw shifts (perturbed - control) and store in ``adata.layers``.
+        """
+        adata = self._validate_anndata(adata)
+        control = adata.layers.get(control_layer)
+        perturbed = adata.layers.get(perturbed_layer)
+        if control is None or perturbed is None:
+            raise ValueError(
+                f"Missing layers: control_layer='{control_layer}' exists={control is not None}, "
+                f"perturbed_layer='{perturbed_layer}' exists={perturbed is not None}"
+            )
+
+        shift = np.full((adata.n_obs, adata.n_vars), np.nan, dtype=float)
+        if mask is None:
+            shift = perturbed - control
+        else:
+            mask_arr = np.asarray(mask)
+            shift[mask_arr] = perturbed[mask_arr] - control[mask_arr]
+        adata.layers[shift_layer] = shift
+
+    @torch.inference_mode()
+    def compute_shift_outputs_obsm(
+        self,
+        adata: AnnData | None = None,
+        obsm_key: str = "resolvi_shift_outputs",
+        perturbation_value: str | int | None = None,
+        perturbation_key: str | None = None,
+        batch_size: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        Compute shift network outputs for a selection and store in ``adata.obsm``.
+        """
+        adata = self._validate_anndata(adata)
+
+        if perturbation_key is None:
+            setup_args_dict = self.adata_manager._get_setup_method_args()
+            from scvi.data._constants import _SETUP_ARGS_KEY
+            setup_args = setup_args_dict.get(_SETUP_ARGS_KEY, {})
+            perturbation_key = setup_args.get("perturbation_key")
+
+        if perturbation_value is None and perturbation_key is not None:
+            mask = np.ones(adata.n_obs, dtype=bool)
+        else:
+            mask = (
+                adata.obs[perturbation_key] == perturbation_value
+                if perturbation_key is not None
+                else np.ones(adata.n_obs, dtype=bool)
+            )
+
+        selected_indices = np.where(mask)[0]
+        shifts_df = self.get_shift_network_outputs(
+            adata=adata, indices=selected_indices, batch_size=batch_size
+        )
+
+        aligned = shifts_df.reindex(adata.obs_names)
+        adata.obsm[obsm_key] = aligned
+
+        perturb_idx = shifts_df.attrs.get("perturbation_indices", None)
+        if perturb_idx is not None:
+            filled = np.full(adata.n_obs, -1, dtype=int)
+            filled[selected_indices] = perturb_idx
+            adata.obs[f"{obsm_key}_perturbation_index"] = filled
+
+        return aligned
+
+    def compute_and_store_umap(
+        self,
+        adata: AnnData | None = None,
+        layer: str | None = None,
+        basis_key: str = "X_resolvi_umap",
+        n_components: int = 50,
+        neighbors_key: str | None = None,
+        **neighbors_kwargs,
+    ) -> np.ndarray:
+        """
+        Compute PCA/neighbors/UMAP on a given layer and store the coordinates.
+        """
+        adata = self._validate_anndata(adata)
+        sc.tl.pca(adata, layer=layer, n_comps=n_components)
+        sc.pp.neighbors(
+            adata,
+            use_rep="X_pca",
+            key_added=neighbors_key,
+            **neighbors_kwargs,
+        )
+        sc.tl.umap(adata)
+        adata.obsm[basis_key] = adata.obsm["X_umap"].copy()
+        return adata.obsm[basis_key]
+
+    def plot_resolvi_umap(
+        self,
+        adata: AnnData | None = None,
+        basis_key: str = "X_resolvi_umap",
+        color: Sequence[str] | str = (),
+        layer: str | None = None,
+        vmax: float | None = None,
+        **kwargs,
+    ):
+        """
+        Plot UMAP using a stored basis key and optional layer.
+        """
+        adata = self._validate_anndata(adata)
+        return sc.pl.umap(
+            adata,
+            color=color,
+            layer=layer,
+            basis=basis_key,
+            vmax=vmax,
+            **kwargs,
+        )
+
+    def plot_shift_volcano(
+        self,
+        adata: AnnData | None = None,
+        shift_layer: str = "resolvi_raw_shifts",
+        count_layer: str = "counts",
+        genes_to_highlight: Sequence[str] | None = None,
+        mask: Sequence[bool] | np.ndarray | None = None,
+        title: str | None = None,
+        ax=None,
+    ):
+        """
+        Volcano-style plot of mean shift vs log1p mean counts.
+        """
+        adata = self._validate_anndata(adata)
+        shifts = adata.layers.get(shift_layer)
+        counts = adata.layers.get(count_layer)
+        if shifts is None or counts is None:
+            raise ValueError(
+                f"Missing layers for volcano: shift_layer='{shift_layer}' exists={shifts is not None}, "
+                f"count_layer='{count_layer}' exists={counts is not None}"
+            )
+
+        if mask is None:
+            mask = np.ones(adata.n_obs, dtype=bool)
+        mask_arr = np.asarray(mask)
+
+        mean_shift = np.nanmean(shifts[mask_arr], axis=0)
+        mean_counts = np.nanmean(counts[mask_arr], axis=0)
+
+        df = pd.DataFrame(
+            {"shift": mean_shift, "mean_counts": np.log1p(mean_counts)}, index=adata.var_names
+        )
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(10, 7))
+
+        ax.scatter(df["mean_counts"], df["shift"], alpha=0.6, s=30)
+
+        if genes_to_highlight is None:
+            genes_to_highlight = []
+
+        for gene in genes_to_highlight:
+            if gene in df.index:
+                idx = df.index.get_loc(gene)
+                ax.annotate(
+                    gene,
+                    (df["mean_counts"].iloc[idx], df["shift"].iloc[idx]),
+                    fontsize=10,
+                    alpha=0.9,
+                    xytext=(5, 5),
+                    textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.3),
+                )
+
+        ax.set_xlabel("Log Mean Counts")
+        ax.set_ylabel("Shift")
+        if title:
+            ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return ax
 
     @torch.inference_mode()
     def get_direct_perturbation_effects(

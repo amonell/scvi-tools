@@ -855,6 +855,7 @@ class RESOLVI(
             anndata_fields.append(ObsmField("spatial_embedding", spatial_embedding_key))
         
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
+        # register_fields does not accept the custom setup kwargs; they are captured in setup_method_args
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
 
