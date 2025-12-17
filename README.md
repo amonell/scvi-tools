@@ -46,6 +46,18 @@ deploying new models with scvi-tools.
 
 # Basic installation
 
+### Environment setup (recommended)
+
+This fork assumes a full scvi-tools scientific Python environment.
+We recommend creating a conda environment:
+
+```bash
+conda env create -f environment.yml
+conda activate resolvi-env
+```
+
+### Package Instalation
+
 For conda,
 
 ```bash
