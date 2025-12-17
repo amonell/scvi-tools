@@ -3,10 +3,10 @@ import warnings
 from collections.abc import Sequence
 from functools import partial
 
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scanpy as sc
+#import scanpy as sc
 import torch
 from anndata import AnnData
 from pyro import infer
@@ -16,6 +16,25 @@ from scvi.model._utils import _get_batch_code_from_category, parse_device_args
 from scvi.utils import track
 
 logger = logging.getLogger(__name__)
+
+# lazy import
+def _require_scanpy():
+    try:
+        import scanpy as sc
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "This function requires scanpy. Install it with `pip install scanpy`."
+        ) from e
+    return sc
+# lazy import
+def _require_matplotlib_pyplot():
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "This function requires matplotlib. Install it with `pip install matplotlib`."
+        ) from e
+    return plt
 
 
 def _safe_log_norm(x: torch.Tensor, dim: int = 1, keepdim: bool = True, eps: float = 1e-12) -> torch.Tensor:
@@ -2502,6 +2521,10 @@ class ResolVIPredictiveMixin:
         """
         Compute PCA/neighbors/UMAP on a given layer and store the coordinates.
         """
+
+        #lazy import
+        sc = _require_scanpy()
+
         adata = self._validate_anndata(adata)
         sc.tl.pca(adata, layer=layer, n_comps=n_components)
         sc.pp.neighbors(
@@ -2526,6 +2549,9 @@ class ResolVIPredictiveMixin:
         """
         Plot UMAP using a stored basis key and optional layer.
         """
+        #lazy import
+        sc = _require_scanpy()
+
         adata = self._validate_anndata(adata)
         return sc.pl.umap(
             adata,
@@ -2549,6 +2575,8 @@ class ResolVIPredictiveMixin:
         """
         Volcano-style plot of mean shift vs log1p mean counts.
         """
+        plt = _require_matplotlib_pyplot()
+        
         adata = self._validate_anndata(adata)
         shifts = adata.layers.get(shift_layer)
         counts = adata.layers.get(count_layer)

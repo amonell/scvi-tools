@@ -60,6 +60,24 @@ pip install scvi-tools
 
 Please be sure to install a version of [PyTorch] that is compatible with your GPU (if applicable).
 
+---
+
+## Goldrath Lab Fork: Perturbation-aware ResolVI
+
+This fork of **scvi-tools** contains a research extension of the **ResolVI** model that adds
+explicit modeling of **perturbation-specific effects in spatial transcriptomics data**.
+
+### Key points
+- This extension is **experimental** and intended for internal lab use
+- It builds directly on the existing ResolVI infrastructure
+- Core scvi-tools functionality is unchanged
+
+### Canonical import
+```python
+from scvi.external.resolvi import PerturbResolVI
+
+---
+
 # Resources
 
 - Tutorials, API reference, and installation guides are available in the [documentation].
