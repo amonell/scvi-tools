@@ -13,4 +13,4 @@ dependencies:
   - pandas
   - pip
   - pip:
-    - "scvi-tools @ git+https://github.com/amonell/scvi-tools.git@perturb-resolvi"
+    - "scvi-tools @ git+https://github.com/amonell/scvi-tools.git@v0.1.0-perturb"
