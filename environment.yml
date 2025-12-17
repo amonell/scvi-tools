@@ -1,0 +1,16 @@
+name: resolvi-perturb-env
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.10
+  - pytorch
+  - pyro-ppl
+  - anndata
+  - scanpy
+  - matplotlib
+  - numpy
+  - pandas
+  - pip
+  - pip:
+    - "scvi-tools @ git+https://github.com/amonell/scvi-tools.git@perturb-resolvi"
