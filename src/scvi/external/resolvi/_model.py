@@ -5,6 +5,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 import pandas as pd
 import pyro
 from pyro.infer import Trace_ELBO
@@ -252,6 +253,23 @@ class RESOLVI(
             getitem_tensors=["X"],
             load_sparse_tensor=True,
         )
+
+        spatial_embedding_mean = None
+        spatial_embedding_std = None
+        if getattr(self.summary_stats, "n_spatial_embedding", 0):
+            spatial_registry = self.adata_manager.get_from_registry("spatial_embedding")
+            spatial_np = (
+                spatial_registry
+                if isinstance(spatial_registry, np.ndarray)
+                else np.asarray(spatial_registry)
+            )
+            spatial_embedding_mean = torch.as_tensor(
+                spatial_np.mean(axis=0), dtype=torch.float32
+            )
+            spatial_embedding_std = torch.as_tensor(
+                spatial_np.std(axis=0), dtype=torch.float32
+            )
+
         self.module = self._module_cls(
             n_input=self.summary_stats.n_vars,
             n_batch=self.summary_stats.n_batch,
@@ -282,6 +300,8 @@ class RESOLVI(
             shift_global_k=shift_global_k,
             shift_min_scale=shift_min_scale,
             spatial_embedding_dim=spatial_embedding_dim,
+            spatial_embedding_mean=spatial_embedding_mean,
+            spatial_embedding_std=spatial_embedding_std,
             **model_kwargs,
         )
         

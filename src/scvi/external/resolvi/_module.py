@@ -306,6 +306,8 @@ class RESOLVAEModel(PyroModule):
         shift_global_k: float = 3.0,
         shift_min_scale: float = 0.1,
         spatial_embedding_dim: int = 0,
+        spatial_embedding_mean: torch.Tensor | None = None,
+        spatial_embedding_std: torch.Tensor | None = None,
     ):
         super().__init__(_RESOLVAE_PYRO_MODULE_NAME)
         self.z_encoder = z_encoder
@@ -329,6 +331,9 @@ class RESOLVAEModel(PyroModule):
         self.perturbation_idx = perturbation_idx  # Index of perturbation in cat_covs
         self.control_penalty_weight = control_penalty_weight
         self.spatial_embedding_dim = spatial_embedding_dim
+        if spatial_embedding_mean is not None and spatial_embedding_std is not None:
+            self.register_buffer("_spatial_mean", spatial_embedding_mean)
+            self.register_buffer("_spatial_std", spatial_embedding_std)
         
         # Store key information for background handling
         self.background_key = None  # Will be set by setup_anndata
@@ -495,6 +500,14 @@ class RESOLVAEModel(PyroModule):
             if isinstance(spatial_embedding, np.ndarray):
                 spatial_embedding = torch.from_numpy(spatial_embedding)
             spatial_embedding = spatial_embedding.to(x.device)
+
+            # Normalize spatial embeddings to the training distribution to avoid drift
+            if self.spatial_embedding_dim > 0:
+                if hasattr(self, "_spatial_mean") and hasattr(self, "_spatial_std"):
+                    # Move buffers to the embedding device to avoid device mismatch
+                    spatial_mean = self._spatial_mean.to(spatial_embedding.device)
+                    spatial_std = torch.clamp(self._spatial_std.to(spatial_embedding.device), min=1e-6)
+                    spatial_embedding = (spatial_embedding - spatial_mean) / spatial_std
 
         x_n = self.expression_anntorchdata[ind_neighbors.cpu().numpy().flatten(), :]["X"]
         if isinstance(x_n, np.ndarray):
@@ -1525,6 +1538,8 @@ class RESOLVAE(PyroBaseModuleClass):
         shift_global_k: float = 3.0,
         shift_min_scale: float = 0.1,
         spatial_embedding_dim: int = 0,
+        spatial_embedding_mean: torch.Tensor | None = None,
+        spatial_embedding_std: torch.Tensor | None = None,
         latent_distribution: str | None = None,
     ):
         super().__init__()
@@ -1618,6 +1633,8 @@ class RESOLVAE(PyroBaseModuleClass):
             shift_global_k=shift_global_k,
             shift_min_scale=shift_min_scale,
             spatial_embedding_dim=spatial_embedding_dim,
+            spatial_embedding_mean=spatial_embedding_mean,
+            spatial_embedding_std=spatial_embedding_std,
         )
         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
 

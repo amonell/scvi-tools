@@ -2376,6 +2376,7 @@ class ResolVIPredictiveMixin:
         adata: AnnData | None = None,
         control_layer: str = "resolvi_expression_no_shift",
         perturbed_layer: str = "resolvi_expression_with_shift",
+        library_size: float | None = None,
         indices: Sequence[int] | np.ndarray | None = None,
         n_samples: int = 1000,
         batch_size: int | None = None,
@@ -2392,6 +2393,7 @@ class ResolVIPredictiveMixin:
         control_expr = self.get_denoised_expression_control(
             adata=adata,
             indices=indices_arr,
+            library_size=library_size,
             n_samples=n_samples,
             batch_size=batch_size,
             return_mean=True,
@@ -2401,6 +2403,7 @@ class ResolVIPredictiveMixin:
         perturbed_expr = self.get_denoised_expression_perturbed(
             adata=adata,
             indices=indices_arr,
+            library_size=library_size,
             n_samples=n_samples,
             batch_size=batch_size,
             return_mean=True,
